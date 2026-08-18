@@ -323,6 +323,15 @@ const std::string& Connection::dbname() const {
     return wire_ ? wire_->dbname() : empty;
 }
 
+const std::string& Connection::dbdir() const {
+    static const std::string empty;
+    return wire_ ? wire_->dbdir() : empty;
+}
+
+std::string Connection::dbrealdir() const {
+    return wire_ ? wire_->info("realdir") : std::string{};
+}
+
 const std::string& Connection::server_version() const {
     static const std::string empty;
     return wire_ ? wire_->server_version() : empty;

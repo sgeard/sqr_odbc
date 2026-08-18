@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -114,6 +115,18 @@ public:
     [[nodiscard]] const std::string& server_version() const { return version_; }
     [[nodiscard]] const std::string& dbname() const { return dbname_; }
 
+    // The database's absolute directory on the server's filesystem, as
+    // reported by INFO during the handshake.  Empty if the server predates
+    // the request — a connection is still perfectly usable without it, so
+    // callers must cope rather than assume.  This is the only thing that
+    // says WHERE a host:port endpoint actually lands: worth having for a
+    // backup, and for telling two sqrd instances apart.
+    [[nodiscard]] const std::string& dbdir() const { return dbdir_; }
+
+    // Any other INFO key ("server", "readonly", "txn", "tables", ...), or
+    // an empty string if the server did not report it.
+    [[nodiscard]] std::string info(std::string_view key) const;
+
     // Execute one SQL statement; any of the four reply kinds may come back.
     Result<Reply> exec(std::string_view sql);
 
@@ -139,6 +152,7 @@ private:
     [[nodiscard]] Result<std::string> recv_payload(std::size_t n);
     [[nodiscard]] Result<Reply> read_reply();
     [[nodiscard]] Result<RowSet> read_rowset(std::string_view header);
+    [[nodiscard]] Result<None> fetch_info();
     void close_fd();
 
     int fd_ = -1;
@@ -146,6 +160,8 @@ private:
     std::size_t rpos_ = 0;    // first unconsumed position in rbuf_
     std::string version_ = {};
     std::string dbname_ = {};
+    std::string dbdir_ = {};
+    std::map<std::string, std::string, std::less<>> info_ = {};
 };
 
 } // namespace sqrw

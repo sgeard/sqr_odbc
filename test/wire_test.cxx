@@ -64,6 +64,13 @@ int main(int argc, char** argv) {
         auto c = dial(srv.port);
         check(c.server_version() == "1.0.0", "server version announced");
         check(c.dbname() == dbdir, "database name announced");
+        // INFO runs as part of the handshake: the endpoint is a host and a
+        // port, so this is the only thing that says where on disk it lands.
+        check(c.dbdir() == std::filesystem::absolute(dbdir).lexically_normal().string(),
+              "INFO reports the absolute database directory");
+        check(c.info("server") == "sqrd 1.0.0", "INFO reports the server version");
+        check(c.info("txn") == "no", "INFO reports no transaction in flight");
+        check(c.info("nosuchkey").empty(), "INFO returns empty for an unknown key");
         check(c.ping().has_value(), "PING answered");
 
         // ---- DDL / DML replies ----

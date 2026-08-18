@@ -158,7 +158,9 @@ Connection::Connection(Connection&& other) noexcept
       rbuf_(std::move(other.rbuf_)),
       rpos_(std::exchange(other.rpos_, 0)),
       version_(std::move(other.version_)),
-      dbname_(std::move(other.dbname_)) {
+      dbname_(std::move(other.dbname_)),
+      dbdir_(std::move(other.dbdir_)),
+      info_(std::move(other.info_)) {
 }
 
 Connection& Connection::operator=(Connection&& other) noexcept {
@@ -169,6 +171,8 @@ Connection& Connection::operator=(Connection&& other) noexcept {
         rpos_ = std::exchange(other.rpos_, 0);
         version_ = std::move(other.version_);
         dbname_ = std::move(other.dbname_);
+        dbdir_ = std::move(other.dbdir_);
+        info_ = std::move(other.info_);
     }
     return *this;
 }
@@ -267,7 +271,48 @@ Result<Connection> Connection::open(std::string_view host, int port,
     }
     c.version_ = std::string(toks[3]);
     c.dbname_ = std::string(toks[4]);
+    // Best effort: a server that predates INFO answers ERR, which costs one
+    // round trip and leaves dbdir() empty.  Not a reason to fail the connect.
+    (void)c.fetch_info();
     return c;
+}
+
+Result<None> Connection::fetch_info() {
+    info_.clear();
+    dbdir_.clear();
+    if (auto sent = send_all("INFO\n"); !sent) {
+        return std::unexpected(sent.error());
+    }
+    auto reply = read_reply();
+    if (!reply) {
+        return std::unexpected(reply.error());
+    }
+    const auto* msg = std::get_if<Msg>(&*reply);
+    if (msg == nullptr) {
+        return std::unexpected(protocol("INFO did not answer with MSG"));
+    }
+    // One "key = value" line per fact; unknown keys are kept, so a newer
+    // server can report more without this client changing.
+    std::string_view rest = msg->text;
+    while (!rest.empty()) {
+        const auto eol = rest.find('\n');
+        const auto line = rest.substr(0, eol);
+        rest = eol == std::string_view::npos ? std::string_view{} : rest.substr(eol + 1);
+        const auto eq = line.find(" = ");
+        if (eq == std::string_view::npos) {
+            continue;
+        }
+        info_.emplace(std::string(line.substr(0, eq)), std::string(line.substr(eq + 3)));
+    }
+    if (const auto it = info_.find("dir"); it != info_.end()) {
+        dbdir_ = it->second;
+    }
+    return None{};
+}
+
+std::string Connection::info(std::string_view key) const {
+    const auto it = info_.find(key);
+    return it == info_.end() ? std::string{} : it->second;
 }
 
 void Connection::quit() {

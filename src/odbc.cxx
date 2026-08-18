@@ -20,7 +20,9 @@
 #include <charconv>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -156,6 +158,13 @@ struct ConnParams {
     std::string server = {};
     std::string port = {};
     std::string timeout = {};
+    // Not a selector — sqrd serves exactly one database, chosen when it was
+    // started, and the protocol has no way to ask for a different one.  It
+    // is an ASSERTION: what the DSN believes it is pointing at.  A DSN whose
+    // only identifying detail is a port number can silently reach the wrong
+    // database when instances are restarted or ports reused, which is
+    // precisely how a Base document ended up on a CAD scratch database.
+    std::string database = {};
 };
 
 // Parse "KEY=value;KEY={value};..." (case-insensitive keys).  A braced value
@@ -201,11 +210,72 @@ struct ConnParams {
             p.port = val;
         } else if (key == "TIMEOUT") {
             p.timeout = val;
+        } else if (key == "DATABASE" || key == "DB") {
+            p.database = val;
         }
         // Anything else (DRIVER, UID, PWD, ...) is accepted and ignored:
         // sqrd has no authentication.
     }
     return p;
+}
+
+// The port sqrd advertises in `<db-dir>/_sqrd`, or 0 if there is no usable
+// one.  A DSN can then name the database directory and leave PORT out
+// entirely, which is the address a user actually knows.  The file is only a
+// hint — nothing removes it when a daemon dies — so the port it yields is
+// worth nothing until the DATABASE assertion below confirms, over the
+// connection, which database is really being served.
+[[nodiscard]] int advertised_port(const std::string& dir) {
+    std::error_code ec;
+    const auto path = std::filesystem::path(dir) / "_sqrd";
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return 0;
+    }
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto eq = line.find(" = ");
+        if (eq == std::string::npos || line.substr(0, eq) != "port") {
+            continue;
+        }
+        const auto val = std::string_view(line).substr(eq + 3);
+        int port = 0;
+        const auto [end, pec] = std::from_chars(val.data(), val.data() + val.size(), port);
+        if (pec == std::errc{} && end == val.data() + val.size() && port > 0 && port <= 65535) {
+            return port;
+        }
+    }
+    return 0;
+}
+
+// Does `want` name the database this connection reached?  Deliberately
+// permissive: the short name, the directory as the server was told to open
+// it, its fully resolved form, and either of those normalised — a symbolic
+// link is a legitimate way to name a database, not a mistake to correct, so
+// any spelling that lands on the same directory is accepted.
+[[nodiscard]] bool database_matches(const sqro::Connection& dbc, const std::string& want) {
+    if (want.empty() || want == dbc.dbname()) {
+        return true;
+    }
+    const auto norm = [](const std::string& p) {
+        if (p.empty()) {
+            return std::string{};
+        }
+        std::error_code ec;
+        const auto c = std::filesystem::weakly_canonical(p, ec);
+        return ec ? std::string{} : c.string();
+    };
+    const std::array wants = {want, norm(want)};
+    const std::array haves = {dbc.dbdir(), dbc.dbrealdir(), norm(dbc.dbdir()), norm(dbc.dbrealdir())};
+    for (const auto& w : wants) {
+        if (w.empty()) {
+            continue;
+        }
+        if (std::ranges::contains(haves, w)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // odbc.ini lookup for a DSN entry.
@@ -222,12 +292,23 @@ Rc do_connect(sqro::Connection* dbc, ConnParams p) {
     if (p.server.empty()) {
         p.server = p.dsn.empty() ? "127.0.0.1" : profile(p.dsn, "SERVER", "127.0.0.1");
     }
+    if (p.timeout.empty() && !p.dsn.empty()) {
+        p.timeout = profile(p.dsn, "TIMEOUT", "");
+    }
+    if (p.database.empty() && !p.dsn.empty()) {
+        p.database = profile(p.dsn, "DATABASE", "");
+    }
+    // DATABASE is resolved before PORT so that naming the directory is
+    // enough: an explicit PORT still wins, and the well-known default is
+    // still the last resort.
+    if (p.port.empty() && !p.database.empty()) {
+        if (const int advertised = advertised_port(p.database); advertised > 0) {
+            p.port = std::to_string(advertised);
+        }
+    }
     if (p.port.empty()) {
         p.port = p.dsn.empty() ? std::to_string(default_port)
                                : profile(p.dsn, "PORT", std::to_string(default_port).c_str());
-    }
-    if (p.timeout.empty() && !p.dsn.empty()) {
-        p.timeout = profile(p.dsn, "TIMEOUT", "");
     }
     int port = 0;
     const auto [end, ec] = std::from_chars(p.port.data(), p.port.data() + p.port.size(), port);
@@ -248,11 +329,26 @@ Rc do_connect(sqro::Connection* dbc, ConnParams p) {
         dbc->set_timeout(seconds);
     }
     const auto rc = dbc->connect(p.server, port);
-    if (rc == Rc::ok) {
-        dbc->dsn = std::move(p.dsn);
-        dbc->host = std::move(p.server);
-        dbc->port = port;
+    if (rc != Rc::ok) {
+        return rc;
     }
+    // Verify the assertion before handing the application a usable
+    // connection: reaching the wrong database silently is worse than
+    // failing to connect.  Either the short name or the absolute directory
+    // satisfies it, so a DSN can say whichever is more stable for its site.
+    if (!database_matches(*dbc, p.database)) {
+        const auto actual = dbc->dbdir().empty() ? dbc->dbname()
+                                                 : std::format("{} ({})", dbc->dbname(), dbc->dbdir());
+        (void)dbc->disconnect();
+        dbc->diag.clear();
+        dbc->diag.post("08001", std::format("DATABASE is '{}' but {}:{} serves {}", p.database,
+                                            p.server, port, actual));
+        return Rc::error;
+    }
+    dbc->dsn = std::move(p.dsn);
+    dbc->host = std::move(p.server);
+    dbc->port = port;
+    dbc->database = std::move(p.database);
     return rc;
 }
 
@@ -263,6 +359,9 @@ Rc do_connect(sqro::Connection* dbc, ConnParams p) {
         s = std::format("DSN={};", dbc.dsn);
     }
     s += std::format("SERVER={};PORT={}", dbc.host, dbc.port);
+    if (!dbc.database.empty()) {
+        s += std::format(";DATABASE={}", dbc.database);
+    }
     return s;
 }
 
@@ -903,7 +1002,13 @@ SQLRETURN SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType, SQLPOINTER
             return copy_str(dbms_version(dbc->server_version()), InfoValue, BufferLength,
                             StringLengthPtr, dbc->diag);
         case SQL_DATABASE_NAME:
-            return copy_str(dbc->dbname(), InfoValue, BufferLength, StringLengthPtr, dbc->diag);
+            // The absolute directory when the server reports one, as the
+            // SQLite driver reports its file path: an application asking
+            // "which database am I on?" wants somewhere on disk, not a bare
+            // basename that several instances could share.  Falls back to
+            // the name against a server that predates INFO.
+            return copy_str(dbc->dbdir().empty() ? dbc->dbname() : dbc->dbdir(), InfoValue,
+                            BufferLength, StringLengthPtr, dbc->diag);
         case SQL_SERVER_NAME:
             return copy_str(dbc->host, InfoValue, BufferLength, StringLengthPtr, dbc->diag);
         case SQL_DATA_SOURCE_NAME:

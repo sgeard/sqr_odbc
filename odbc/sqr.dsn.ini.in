@@ -5,10 +5,24 @@
 ; Driver is a full path, so no odbcinst.ini registration is needed; SERVER
 ; and PORT say where sqrd is listening (the database is whichever one that
 ; sqrd instance serves).
+;
+; BETTER: set DATABASE to the database directory and delete PORT.  sqrd
+; records the port it bound in <db-dir>/_sqrd and the driver reads it from
+; there, so the DSN names the thing you actually mean and survives the daemon
+; restarting on a different port.  Symbolic links are fine.
+;
+; DATABASE never CHOOSES a database — sqrd serves the one it was started with
+; and the protocol cannot ask for another.  It is also an assertion: the
+; driver asks the server which directory it is serving and fails with
+; SQLSTATE 08001 if the answer disagrees, which is what makes the _sqrd file
+; (nothing removes it when a daemon dies) safe to trust.
+;
+; `sqrbak info <db-dir>` prints everything this file might want.
 [sqr]
 Description = sqr database via sqrd
 Driver      = @DRIVER@
 SERVER      = 127.0.0.1
 PORT        = 7477
+; DATABASE  = /path/to/your/database
 ; Connect/request timeout in seconds; 0 waits forever.  Omitted = 30.
 TIMEOUT     = 30

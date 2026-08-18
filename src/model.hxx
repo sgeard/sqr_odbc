@@ -89,6 +89,10 @@ public:
     std::string dsn = {};
     std::string host = {};
     int port = 0;
+    // The DATABASE assertion this connection was made with, if any — kept so
+    // the out connection string can echo it back verbatim.  Not a selector:
+    // sqrd serves one database, fixed when it started.
+    std::string database = {};
 
     Rc connect(std::string_view host, int port);
     Rc disconnect();                            // 25000 with a transaction open
@@ -101,6 +105,13 @@ public:
     [[nodiscard]] int timeout() const { return timeout_; }
     [[nodiscard]] bool connected() const { return wire_.has_value(); }
     [[nodiscard]] const std::string& dbname() const;
+    // Absolute directory of the served database, from INFO; empty against a
+    // server that predates the request.  dbdir() is the directory as the
+    // server was told to open it (a symbolic link survives, because it is
+    // usually the name that matters); dbrealdir() is the same directory
+    // fully resolved, and is empty when the two coincide.
+    [[nodiscard]] const std::string& dbdir() const;
+    [[nodiscard]] std::string dbrealdir() const;
     [[nodiscard]] const std::string& server_version() const;
 
     // SQL_ATTR_AUTOCOMMIT.  Off = the driver wraps work in BEGIN...COMMIT

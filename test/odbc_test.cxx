@@ -108,6 +108,56 @@ int main(int argc, char** argv) {
               "dbc2 torn down");
     }
 
+    // DATABASE is an assertion about which database the endpoint serves, not
+    // a selector.  It is the guard against a DSN — whose only identifying
+    // detail is a port number — quietly reaching the wrong database.
+    {
+        const auto abs = std::filesystem::absolute(dbdir).lexically_normal().string();
+        SQLHDBC dbc3 = SQL_NULL_HANDLE;
+        check(SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc3) == SQL_SUCCESS, "alloc dbc3");
+        const auto ok_name = std::string("SERVER=127.0.0.1;PORT=") + std::to_string(srv.port)
+                             + ";DATABASE=" + dbdir;
+        check(SQLDriverConnect(dbc3, nullptr, sqlstr(ok_name.c_str()), SQL_NTS, nullptr, 0, nullptr,
+                               SQL_DRIVER_NOPROMPT) == SQL_SUCCESS,
+              "DATABASE matching the name connects");
+        check(SQLDisconnect(dbc3) == SQL_SUCCESS, "dbc3 disconnected");
+        const auto ok_path = std::string("SERVER=127.0.0.1;PORT=") + std::to_string(srv.port)
+                             + ";DATABASE=" + abs;
+        check(SQLDriverConnect(dbc3, nullptr, sqlstr(ok_path.c_str()), SQL_NTS, nullptr, 0, nullptr,
+                               SQL_DRIVER_NOPROMPT) == SQL_SUCCESS,
+              "DATABASE matching the absolute path connects");
+        check(SQLDisconnect(dbc3) == SQL_SUCCESS, "dbc3 disconnected again");
+        // Naming the directory is enough: no PORT at all, read from the
+        // _sqrd file sqrd writes into the database it serves.
+        const auto by_dir = std::string("SERVER=127.0.0.1;DATABASE=") + abs;
+        check(SQLDriverConnect(dbc3, nullptr, sqlstr(by_dir.c_str()), SQL_NTS, nullptr, 0, nullptr,
+                               SQL_DRIVER_NOPROMPT) == SQL_SUCCESS,
+              "DATABASE alone finds the port from _sqrd");
+        check(SQLDisconnect(dbc3) == SQL_SUCCESS, "dbc3 disconnected after _sqrd connect");
+
+        // A symlink is a legitimate name for a database, not a mistake.
+        std::error_code ec;
+        const auto link = std::filesystem::absolute("odbc_test_link").lexically_normal();
+        std::filesystem::remove(link, ec);
+        std::filesystem::create_directory_symlink(abs, link, ec);
+        if (!ec) {
+            const auto by_link = std::string("SERVER=127.0.0.1;DATABASE=") + link.string();
+            check(SQLDriverConnect(dbc3, nullptr, sqlstr(by_link.c_str()), SQL_NTS, nullptr, 0,
+                                   nullptr, SQL_DRIVER_NOPROMPT) == SQL_SUCCESS,
+                  "DATABASE through a symlink connects and matches");
+            check(SQLDisconnect(dbc3) == SQL_SUCCESS, "dbc3 disconnected after symlink connect");
+            std::filesystem::remove(link, ec);
+        }
+
+        const auto wrong = std::string("SERVER=127.0.0.1;PORT=") + std::to_string(srv.port)
+                           + ";DATABASE=some_other_db";
+        check(SQLDriverConnect(dbc3, nullptr, sqlstr(wrong.c_str()), SQL_NTS, nullptr, 0, nullptr,
+                               SQL_DRIVER_NOPROMPT) == SQL_ERROR
+                  && diag_state(SQL_HANDLE_DBC, dbc3) == "08001",
+              "DATABASE naming a different database is refused with 08001");
+        check(SQLFreeHandle(SQL_HANDLE_DBC, dbc3) == SQL_SUCCESS, "dbc3 freed");
+    }
+
     // ---- SQLGetInfo / SQLGetFunctions ----
     {
         std::array<SQLCHAR, 64> buf = {};
@@ -131,6 +181,17 @@ int main(int argc, char** argv) {
         check(SQLGetInfo(dbc, 9999, buf.data(), 0, nullptr) == SQL_ERROR
                   && diag_state(SQL_HANDLE_DBC, dbc) == "HY096",
               "unknown info type is HY096");
+        {
+            // An application asking which database it is on gets somewhere on
+            // disk, not a basename several instances could share.
+            std::array<SQLCHAR, 512> dbbuf = {};
+            SQLSMALLINT dbn = 0;
+            check(SQLGetInfo(dbc, SQL_DATABASE_NAME, dbbuf.data(),
+                             static_cast<SQLSMALLINT>(dbbuf.size()), &dbn) == SQL_SUCCESS
+                      && std::string(reinterpret_cast<char*>(dbbuf.data()))
+                             == std::filesystem::absolute(dbdir).lexically_normal().string(),
+                  "SQL_DATABASE_NAME is the absolute directory");
+        }
 
         SQLUSMALLINT sup = SQL_FALSE;
         check(SQLGetFunctions(dbc, SQL_API_SQLFETCH, &sup) == SQL_SUCCESS && sup == SQL_TRUE,
