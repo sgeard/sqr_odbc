@@ -34,6 +34,17 @@ namespace sqro {
 // Operation outcome; the trampolines map this onto SQLRETURN.
 enum class Rc { ok, ok_info, no_data, error };
 
+// How one wire column type appears through ODBC eyes.  Shared by the
+// catalogue builders (catalog.cxx, where it is defined) and by
+// SQLDescribeCol / SQLColAttribute in the trampolines.
+struct TypeFacts {
+    SQLSMALLINT sql_type = 0;
+    const char* type_name = "";
+    int column_size = 0;
+    bool is_char = false;
+};
+[[nodiscard]] TypeFacts type_facts(sqrw::ColType type, int csize);
+
 class Connection;
 class Statement;
 
@@ -54,6 +65,7 @@ public:
     [[nodiscard]] Connection* create_connection();
     Rc free_connection(Connection* conn);      // HY010 while still connected
     [[nodiscard]] bool has_connections() const { return !connections_.empty(); }
+    Rc end_tran(bool commit);                  // SQLEndTran on the environment: all connections
 
 private:
     std::vector<std::unique_ptr<Connection>> connections_ = {};
@@ -61,12 +73,20 @@ private:
 
 class Connection {
 public:
-    Connection();          // out-of-line: see Environment
+    explicit Connection(Environment& env);     // out-of-line: see Environment
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
     DiagStack diag = {};
+    [[nodiscard]] Environment& env() { return *env_; }
+
+    // Connect-time identity, echoed back through SQLGetInfo
+    // (SQL_DATA_SOURCE_NAME / SQL_SERVER_NAME) and SQLDriverConnect's out
+    // string.  Owned by the trampolines.
+    std::string dsn = {};
+    std::string host = {};
+    int port = 0;
 
     Rc connect(std::string_view host, int port);
     Rc disconnect();                            // 25000 with a transaction open
@@ -92,6 +112,7 @@ public:
     [[nodiscard]] sqrw::Result<sqrw::None> ensure_txn();
 
 private:
+    Environment* env_;
     std::optional<sqrw::Connection> wire_ = {};
     std::vector<std::unique_ptr<Statement>> statements_ = {};
     bool autocommit_ = true;
@@ -103,6 +124,14 @@ public:
     explicit Statement(Connection& conn) : conn_(&conn) {}
 
     DiagStack diag = {};
+    [[nodiscard]] Connection& connection() { return *conn_; }
+
+    // Fetch-status reporting (SQL_ATTR_ROWS_FETCHED_PTR / ROW_STATUS_PTR)
+    // and the cursor name.  Owned and written by the trampolines; stored
+    // here because they are per-statement state.
+    SQLULEN* rows_fetched_ptr = nullptr;
+    SQLUSMALLINT* row_status_ptr = nullptr;
+    std::string cursor_name = {};
 
     // --- statement preparation and execution ---
     Rc prepare(std::string_view sql);
@@ -116,11 +145,13 @@ public:
     Rc bind_param(int number, SQLSMALLINT ctype, SQLSMALLINT stype,
                   const void* value, const SQLLEN* ind);
     Rc reset_params();
+    [[nodiscard]] int num_params() const;        // marker count of the prepared statement
 
     // --- result set ---
     [[nodiscard]] int num_result_cols() const;
     [[nodiscard]] const sqrw::Column* column(int i) const;   // 1-based; nullptr if out of range
     [[nodiscard]] SQLLEN row_count() const { return affected_; }
+    [[nodiscard]] SQLLEN current_row() const { return static_cast<SQLLEN>(row_); }
 
     // Deferred output binding (SQLBindCol): buffers are WRITTEN AT FETCH
     // TIME.  ctype = 0 (SQL_UNBIND semantics) drops the binding.
@@ -134,11 +165,17 @@ public:
     Rc free_close();                             // SQL_CLOSE: like close_cursor but never an error
 
     // --- catalogue result sets (SQLTables / SQLColumns / SQLPrimaryKeys /
-    //     SQLGetTypeInfo); each opens a cursor over a synthesised set ---
-    Rc catalog_tables();
+    //     SQLGetTypeInfo / SQLSpecialColumns / SQLStatistics /
+    //     SQLForeignKeys); each opens a cursor over a synthesised set ---
+    Rc catalog_tables(std::string_view name = {});         // exact-name filter; ""/"%" = all
     Rc catalog_columns(std::string_view table);
     Rc catalog_primary_keys(std::string_view table);
-    Rc catalog_type_info();
+    Rc catalog_type_info(int data_type = SQL_ALL_TYPES);   // filtered unless SQL_ALL_TYPES
+    Rc catalog_special_columns(std::string_view table,
+                               bool best_rowid = true);    // best rowid = the unique key;
+                                                           // false (ROWVER) = empty set
+    Rc catalog_statistics(std::string_view table);         // the unique index, if any
+    Rc catalog_foreign_keys();                             // always empty: sqr has none
 
 private:
     struct ParamBinding {

@@ -1,0 +1,11 @@
+/* libsqrodbc.so exports the ODBC entry points and nothing else: the
+   driver's C++ internals (and its statically linked runtime) are forced
+   local here so they can never clash with the host application's.  This is
+   the sole export control — compiling -fvisibility=hidden would hide the
+   SQL* definitions themselves before this script could bless them. */
+SQRODBC_1.0 {
+    global:
+        SQL*;
+    local:
+        *;
+};

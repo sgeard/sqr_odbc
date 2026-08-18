@@ -202,12 +202,12 @@ namespace {
 
 Environment::Environment() = default;
 Environment::~Environment() = default;
-Connection::Connection() = default;
+Connection::Connection(Environment& env) : env_(&env) {}
 Connection::~Connection() = default;
 
 Connection* Environment::create_connection() {
     diag.clear();
-    connections_.push_back(std::make_unique<Connection>());
+    connections_.push_back(std::make_unique<Connection>(*this));
     return connections_.back().get();
 }
 
@@ -225,6 +225,18 @@ Rc Environment::free_connection(Connection* conn) {
     }
     connections_.erase(at);
     return Rc::ok;
+}
+
+Rc Environment::end_tran(bool commit) {
+    diag.clear();
+    auto rc = Rc::ok;
+    for (const auto& conn : connections_) {
+        if (conn->connected() && conn->end_tran(commit) == Rc::error) {
+            diag.post("HY000", "transaction completion failed on a connection");
+            rc = Rc::error;
+        }
+    }
+    return rc;
 }
 
 // ==== Connection =========================================================
@@ -526,6 +538,10 @@ Rc Statement::reset_params() {
     diag.clear();
     params_.clear();
     return Rc::ok;
+}
+
+int Statement::num_params() const {
+    return prepared_ ? static_cast<int>(segments_.size()) - 1 : 0;
 }
 
 int Statement::num_result_cols() const {
