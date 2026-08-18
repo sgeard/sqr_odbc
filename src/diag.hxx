@@ -48,8 +48,14 @@ public:
         return recnum >= 1 && recnum <= recs_.size() ? &recs_[recnum - 1] : nullptr;
     }
 
+    // SQL_DIAG_RETURNCODE: the SQLRETURN of the last operation on this
+    // handle, recorded by the trampolines (short = SQLSMALLINT = SQLRETURN).
+    void set_return_code(short rc) { return_code_ = rc; }
+    [[nodiscard]] short return_code() const { return return_code_; }
+
 private:
     std::vector<DiagRecord> recs_ = {};
+    short return_code_ = 0;
 };
 
 } // namespace sqro

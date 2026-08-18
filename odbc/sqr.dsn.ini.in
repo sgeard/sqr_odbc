@@ -10,3 +10,5 @@ Description = sqr database via sqrd
 Driver      = @DRIVER@
 SERVER      = 127.0.0.1
 PORT        = 7477
+; Connect/request timeout in seconds; 0 waits forever.  Omitted = 30.
+TIMEOUT     = 30

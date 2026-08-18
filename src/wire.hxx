@@ -33,6 +33,7 @@ inline constexpr int busy_stat = 100;                    // server ERR stat for 
 // sqr_net's server-side values), not tunables of this client.
 inline constexpr std::size_t max_line = 1024;            // header-line cap (bytes, excluding the LF)
 inline constexpr std::size_t max_payload = 1024 * 1024;  // payload cap (1 MiB)
+inline constexpr std::size_t max_name = 32;              // table/column name cap (SQR_NAME_LEN)
 
 // Wire column types (the COL line's type token).
 enum class ColType { Int, Real, Char, Text };
@@ -81,7 +82,7 @@ using Reply = std::variant<None, Count, Msg, RowSet>;
 // sql_real formats shortest-round-trip (std::to_chars), which satisfies the
 // protocol's 17-significant-digit rule; sql_quote doubles embedded quotes.
 [[nodiscard]] std::string sql_real(double v);
-[[nodiscard]] std::string sql_int(std::int32_t v);
+[[nodiscard]] std::string sql_int(std::int64_t v);
 [[nodiscard]] std::string sql_quote(std::string_view s);
 
 // One connection to a sqrd instance.  Obtain with open(); movable, not
@@ -99,8 +100,15 @@ public:
 
     // Connect to host:port (numeric IPv4 text, e.g. "127.0.0.1") and
     // perform the HELLO exchange, announcing `client_name`.
+    // `timeout_seconds` bounds the connect and every subsequent send/recv
+    // (0 = wait forever).
     [[nodiscard]] static Result<Connection> open(std::string_view host, int port,
-                                                 std::string_view client_name);
+                                                 std::string_view client_name,
+                                                 int timeout_seconds = 0);
+
+    // Re-arm the I/O timeout on the live socket (0 = none).  A request that
+    // times out closes the connection: the stream can never be resynced.
+    void set_timeout(int seconds);
 
     [[nodiscard]] bool is_open() const { return fd_ >= 0; }
     [[nodiscard]] const std::string& server_version() const { return version_; }

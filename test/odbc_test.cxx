@@ -88,6 +88,26 @@ int main(int argc, char** argv) {
           "out connection string is canonical");
     check(SQLFetch(nullptr) == SQL_INVALID_HANDLE, "null handle is SQL_INVALID_HANDLE");
 
+    // Braced values may contain ';' (the standard escape), and TIMEOUT is a
+    // recognised key that lands in the connection attributes.
+    {
+        SQLHDBC dbc2 = SQL_NULL_HANDLE;
+        check(SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc2) == SQL_SUCCESS, "alloc dbc2");
+        const auto cs2 = std::string("PWD={a;PORT=99999};SERVER=127.0.0.1;PORT=")
+                         + std::to_string(srv.port) + ";TIMEOUT=5";
+        check(SQLDriverConnect(dbc2, nullptr, sqlstr(cs2.c_str()), SQL_NTS, nullptr, 0, nullptr,
+                               SQL_DRIVER_NOPROMPT) == SQL_SUCCESS,
+              "braced value containing ';' parses");
+        SQLUINTEGER tmo = 0;
+        check(SQLGetConnectAttr(dbc2, SQL_ATTR_CONNECTION_TIMEOUT, &tmo, 0, nullptr)
+                      == SQL_SUCCESS
+                  && tmo == 5,
+              "TIMEOUT key reaches SQL_ATTR_CONNECTION_TIMEOUT");
+        check(SQLDisconnect(dbc2) == SQL_SUCCESS
+                  && SQLFreeHandle(SQL_HANDLE_DBC, dbc2) == SQL_SUCCESS,
+              "dbc2 torn down");
+    }
+
     // ---- SQLGetInfo / SQLGetFunctions ----
     {
         std::array<SQLCHAR, 64> buf = {};
@@ -127,6 +147,12 @@ int main(int argc, char** argv) {
     // ---- DDL, prepared inserts with deferred buffers ----
     SQLHSTMT stmt = SQL_NULL_HANDLE;
     check(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt) == SQL_SUCCESS, "alloc stmt");
+    {
+        SQLSMALLINT np = 0;
+        check(SQLNumParams(stmt, &np) == SQL_ERROR
+                  && diag_state(SQL_HANDLE_STMT, stmt) == "HY010",
+              "SQLNumParams before prepare is HY010");
+    }
     check(SQLExecDirect(stmt,
                         sqlstr("CREATE TABLE t (id INTEGER, x REAL, name CHAR(12), note TEXT)"),
                         SQL_NTS) == SQL_SUCCESS,
@@ -148,6 +174,11 @@ int main(int argc, char** argv) {
                               static_cast<SQLSMALLINT>(st.size()), &n) == SQL_SUCCESS
                   && std::string(reinterpret_cast<char*>(st.data())) == "42000",
               "SQL_DIAG_SQLSTATE field");
+        SQLRETURN lastrc = 0;
+        check(SQLGetDiagField(SQL_HANDLE_STMT, stmt, 0, SQL_DIAG_RETURNCODE, &lastrc, 0,
+                              nullptr) == SQL_SUCCESS
+                  && lastrc == SQL_ERROR,
+              "SQL_DIAG_RETURNCODE");
     }
 
     check(SQLPrepare(stmt, sqlstr("INSERT INTO t VALUES (?, ?, ?, ?)"), SQL_NTS) == SQL_SUCCESS,
@@ -172,7 +203,14 @@ int main(int argc, char** argv) {
               && SQLBindParameter(stmt, 4, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 0, 0,
                                   note.data(), 0, &note_ind) == SQL_SUCCESS,
           "bind 4 parameters");
-    check(SQLExecute(stmt) == SQL_SUCCESS, "execute insert 1");
+    SQLULEN nproc = 99;
+    std::array<SQLUSMALLINT, 1> pstatus = {99};
+    check(SQLSetStmtAttr(stmt, SQL_ATTR_PARAMS_PROCESSED_PTR, &nproc, 0) == SQL_SUCCESS
+              && SQLSetStmtAttr(stmt, SQL_ATTR_PARAM_STATUS_PTR, pstatus.data(), 0)
+                     == SQL_SUCCESS,
+          "set param status pointers");
+    check(SQLExecute(stmt) == SQL_SUCCESS && nproc == 1 && pstatus[0] == SQL_PARAM_SUCCESS,
+          "execute insert 1 (param status reported)");
     SQLLEN affected = 0;
     check(SQLRowCount(stmt, &affected) == SQL_SUCCESS && affected == 1, "SQLRowCount");
 
@@ -186,6 +224,18 @@ int main(int argc, char** argv) {
                            nullptr) == SQL_ERROR
               && diag_state(SQL_HANDLE_STMT, stmt) == "HYC00",
           "output parameters refused");
+    {
+        // the indicator is deferred: data-at-exec is accepted at bind time
+        // and refused at execute time
+        SQLLEN daexec = SQL_DATA_AT_EXEC;
+        check(SQLBindParameter(stmt, 4, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 0, 0,
+                               note.data(), 0, &daexec) == SQL_SUCCESS,
+              "data-at-exec indicator accepted at bind time");
+        check(SQLExecute(stmt) == SQL_ERROR && diag_state(SQL_HANDLE_STMT, stmt) == "HYC00",
+              "data-at-exec refused at execute time");
+        check(nproc == 0 && pstatus[0] == SQL_PARAM_ERROR,
+              "failed execute reports param error status");
+    }
 
     // ---- SELECT: describe, bind, fetch, get data ----
     check(SQLExecDirect(stmt, sqlstr("SELECT id, x, name, note FROM t ORDER BY id"), SQL_NTS)
@@ -268,6 +318,13 @@ int main(int argc, char** argv) {
         check(SQLGetData(stmt, 4, SQL_C_CHAR, chunk.data(), chunk.size(), &ind) == SQL_SUCCESS
                   && ind == SQL_NULL_DATA,
               "GetData NULL note");
+        check(SQLGetData(stmt, 1, SQL_C_SLONG, nullptr, 0, &ind) == SQL_ERROR
+                  && diag_state(SQL_HANDLE_STMT, stmt) == "HY009",
+              "GetData with a null buffer is HY009");
+        SQLBIGINT big = 0;
+        check(SQLGetData(stmt, 1, SQL_C_SBIGINT, &big, sizeof big, &ind) == SQL_SUCCESS
+                  && big == 2 && ind == 8,
+              "GetData SQL_C_SBIGINT");
         check(SQLFetch(stmt) == SQL_NO_DATA && nfetched == 0, "fetch past the end");
         check(SQLMoreResults(stmt) == SQL_NO_DATA, "SQLMoreResults");
         check(SQLCloseCursor(stmt) == SQL_SUCCESS, "SQLCloseCursor");
@@ -282,6 +339,13 @@ int main(int argc, char** argv) {
     // ---- SQLFetchScroll (forward only) ----
     check(SQLExecDirect(stmt, sqlstr("SELECT id FROM t ORDER BY id"), SQL_NTS) == SQL_SUCCESS,
           "SELECT for FetchScroll");
+    {
+        SQLLEN diag_rows = 0;
+        check(SQLGetDiagField(SQL_HANDLE_STMT, stmt, 0, SQL_DIAG_CURSOR_ROW_COUNT, &diag_rows,
+                              0, nullptr) == SQL_SUCCESS
+                  && diag_rows == 2,
+              "SQL_DIAG_CURSOR_ROW_COUNT");
+    }
     check(SQLFetchScroll(stmt, SQL_FETCH_NEXT, 0) == SQL_SUCCESS, "FetchScroll NEXT");
     check(SQLFetchScroll(stmt, SQL_FETCH_PRIOR, 0) == SQL_ERROR
               && diag_state(SQL_HANDLE_STMT, stmt) == "HY106",
@@ -337,10 +401,25 @@ int main(int argc, char** argv) {
               && count_rows(stmt) == 0,
           "SQLTables type filter VIEW is empty");
     check(SQLFreeStmt(stmt, SQL_CLOSE) == SQL_SUCCESS
+              && SQLTables(stmt, nullptr, 0, nullptr, 0, nullptr, 0, sqlstr("SYSTEM TABLE"),
+                           SQL_NTS) == SQL_SUCCESS
+              && count_rows(stmt) == 0,
+          "SQLTables SYSTEM TABLE does not match TABLE");
+    check(SQLFreeStmt(stmt, SQL_CLOSE) == SQL_SUCCESS
+              && SQLTables(stmt, nullptr, 0, nullptr, 0, nullptr, 0, sqlstr("VIEW,'TABLE'"),
+                           SQL_NTS) == SQL_SUCCESS
+              && count_rows(stmt) == 1,
+          "SQLTables quoted TABLE in a type list matches");
+    check(SQLFreeStmt(stmt, SQL_CLOSE) == SQL_SUCCESS
               && SQLColumns(stmt, nullptr, 0, nullptr, 0, sqlstr("t"), SQL_NTS, nullptr, 0)
                      == SQL_SUCCESS
               && count_rows(stmt) == 4,
           "SQLColumns has 4 rows");
+    check(SQLFreeStmt(stmt, SQL_CLOSE) == SQL_SUCCESS
+              && SQLColumns(stmt, nullptr, 0, nullptr, 0, sqlstr("t"), SQL_NTS, sqlstr("name"),
+                            SQL_NTS) == SQL_SUCCESS
+              && count_rows(stmt) == 1,
+          "SQLColumns column filter keeps one row");
     check(SQLFreeStmt(stmt, SQL_CLOSE) == SQL_SUCCESS
               && SQLPrimaryKeys(stmt, nullptr, 0, nullptr, 0, sqlstr("t"), SQL_NTS)
                      == SQL_SUCCESS
@@ -373,6 +452,20 @@ int main(int argc, char** argv) {
               && count_rows(stmt) == 0,
           "SQLForeignKeys is empty");
     check(SQLFreeStmt(stmt, SQL_CLOSE) == SQL_SUCCESS, "close catalogue cursor");
+
+    // regression: SQLExecute on a statement whose only history is a
+    // catalogue set must be HY010 after the cursor closes, not a crash
+    {
+        SQLHSTMT stmt2 = SQL_NULL_HANDLE;
+        check(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt2) == SQL_SUCCESS
+                  && SQLTables(stmt2, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0)
+                         == SQL_SUCCESS
+                  && SQLFreeStmt(stmt2, SQL_CLOSE) == SQL_SUCCESS
+                  && SQLExecute(stmt2) == SQL_ERROR
+                  && diag_state(SQL_HANDLE_STMT, stmt2) == "HY010",
+              "SQLExecute after a closed catalogue cursor is HY010");
+        check(SQLFreeHandle(SQL_HANDLE_STMT, stmt2) == SQL_SUCCESS, "free regression stmt");
+    }
 
     // ---- SQLNativeSql ----
     {

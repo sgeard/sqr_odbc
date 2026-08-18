@@ -81,7 +81,7 @@ Rc Statement::catalog_tables(std::string_view name) {
     return open_synthetic(std::move(rs));
 }
 
-Rc Statement::catalog_columns(std::string_view table) {
+Rc Statement::catalog_columns(std::string_view table, std::string_view column) {
     diag.clear();
     auto* wire = conn_->wire();
     if (wire == nullptr) {
@@ -115,7 +115,13 @@ Rc Statement::catalog_columns(std::string_view table) {
     rs.rows.reserve(cols->size());
     int ordinal = 0;
     for (auto& c : *cols) {
+        // ORDINAL_POSITION is the position in the table, so it advances
+        // whether or not the column survives the filter (exact-name only,
+        // the same convention as tables).
         ++ordinal;
+        if (!column.empty() && column != "%" && column != c.name) {
+            continue;
+        }
         const auto f = type_facts(c.type, c.csize);
         rs.rows.push_back({N(),                        // TABLE_CAT
                            N(),                        // TABLE_SCHEM
@@ -223,6 +229,8 @@ Rc Statement::catalog_type_info(int data_type) {
     };
     rs.rows.push_back(row("INTEGER", SQL_INTEGER, 10, false, true));
     rs.rows.push_back(row("DOUBLE", SQL_DOUBLE, 15, false, false));
+    // The engine bounds CHAR(n) only by the record cap (SQR_MAX_RECORD,
+    // 1 MiB); 65535 is a deliberately conservative advertisement.
     rs.rows.push_back(row("VARCHAR", SQL_VARCHAR, 65535, true, false));
     rs.rows.push_back(row("LONGVARCHAR", SQL_LONGVARCHAR,
                           static_cast<int>(sqrw::max_payload), true, false));

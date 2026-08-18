@@ -7,6 +7,10 @@
 #include "wire.hxx"
 #include "testutil.hxx"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -124,6 +128,12 @@ int main(int argc, char** argv) {
         check(!nocols && nocols.error().kind == sqrw::Error::Kind::server
                   && !nocols.error().message.empty(),
               "COLUMNS on a missing table is a server error");
+        // A name that could break line framing is rejected before a byte is
+        // sent — and the connection must still be in sync afterwards.
+        auto badname = c.columns("no such\ntable");
+        check(!badname && badname.error().kind == sqrw::Error::Kind::protocol,
+              "framing-hostile table name rejected client-side");
+        check(c.ping().has_value(), "connection still in sync after the rejection");
 
         // ---- errors ----
         auto bad_sql = c.exec("SELEC oops");
@@ -150,6 +160,27 @@ int main(int argc, char** argv) {
               "write allowed once the transaction closes");
         c2.quit();
         check(!c2.is_open(), "quit closes the connection");
+
+        // ---- timeout against a silent listener ----
+        // A socket that listens but never speaks: connect succeeds (kernel
+        // backlog), the HELLO reply never comes, and the 1 s I/O timeout
+        // must turn that into a transport error rather than a hang.
+        {
+            const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in a = {};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = 0;
+            ::bind(lfd, reinterpret_cast<const sockaddr*>(&a), sizeof a);
+            ::listen(lfd, 1);
+            socklen_t alen = sizeof a;
+            ::getsockname(lfd, reinterpret_cast<sockaddr*>(&a), &alen);
+            auto mute = sqrw::Connection::open("127.0.0.1", ntohs(a.sin_port), "wire_test", 1);
+            check(!mute && mute.error().kind == sqrw::Error::Kind::transport
+                      && mute.error().message.find("timed out") != std::string::npos,
+                  "silent server times out with a transport error");
+            ::close(lfd);
+        }
 
         // ---- server disappears ----
         testutil::stop_sqrd(srv);

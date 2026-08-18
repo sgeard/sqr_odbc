@@ -48,7 +48,8 @@ int main(int argc, char** argv) {
         sqro::Environment env;
         auto* dbc = env.create_connection();
         check(dbc != nullptr, "connection allocated");
-        check(env.free_connection(nullptr) == Rc::error, "freeing an unknown handle is refused");
+        check(env.free_connection(nullptr) == Rc::invalid,
+              "freeing an unknown handle is Rc::invalid (SQL_INVALID_HANDLE)");
         check(dbc->connect("127.0.0.1", 1) == Rc::error && state_of(*dbc) == "08001",
               "failed connect posts 08001");
         check(dbc->connect("127.0.0.1", srv.port) == Rc::ok, "connect");
@@ -104,6 +105,19 @@ int main(int argc, char** argv) {
         note_ind = SQL_NTS;
         std::strcpy(note, "a longer note");   // 13 chars: will truncate into out_note[8]
         check(stmt->execute() == Rc::ok, "third row");
+
+        // ---- indicator values are read at execute time, never bind time ----
+        SQLLEN bad_ind = SQL_DATA_AT_EXEC;
+        check(stmt->bind_param(4, SQL_C_CHAR, SQL_LONGVARCHAR, note, &bad_ind) == Rc::ok,
+              "data-at-exec indicator accepted at bind time (deferred buffer)");
+        check(stmt->execute() == Rc::error && state_of(*stmt) == "HYC00",
+              "data-at-execution refused at execute time");
+        bad_ind = -42;
+        check(stmt->execute() == Rc::error && state_of(*stmt) == "HY090",
+              "garbage negative indicator is HY090 at execute time");
+        check(stmt->bind_param(4, SQL_C_CHAR, SQL_LONGVARCHAR, nullptr, nullptr) == Rc::ok
+                  && stmt->execute() == Rc::error && state_of(*stmt) == "HY009",
+              "null parameter buffer is HY009 at execute time");
 
         // ---- fetch with bound columns and conversions ----
         check(stmt->exec_direct("SELECT * FROM t ORDER BY id") == Rc::ok, "SELECT");
@@ -173,6 +187,12 @@ int main(int argc, char** argv) {
         check(stmt->get_data(9, SQL_C_CHAR, chunk, sizeof chunk, &chunk_ind) == Rc::error
                   && state_of(*stmt) == "07009",
               "bad column index is 07009");
+        check(stmt->get_data(2, SQL_C_SLONG, nullptr, 0, &chunk_ind) == Rc::error
+                  && state_of(*stmt) == "HY009",
+              "null GetData buffer is HY009");
+        check(stmt->get_data(2, SQL_C_CHAR, chunk, 1, &chunk_ind) == Rc::error
+                  && state_of(*stmt) == "HY090",
+              "1-byte GetData buffer (no progress possible) is HY090");
 
         // ---- numeric edge conversions ----
         // (bindings persist across statements, so unbind before reusing stmt)
@@ -188,6 +208,38 @@ int main(int argc, char** argv) {
         check(stmt->get_data(2, SQL_C_SLONG, &whole, sizeof whole, nullptr) == Rc::ok_info
                   && whole == 0 && state_of(*stmt) == "01S07",
               "double -> int truncates the fraction with 01S07");
+
+        // ---- wider C-type targets ----
+        SQLBIGINT big = 0;
+        SQLLEN big_ind = 0;
+        check(stmt->get_data(1, SQL_C_SBIGINT, &big, sizeof big, &big_ind) == Rc::ok
+                  && big == 1 && big_ind == 8,
+              "int -> SBIGINT");
+        unsigned char bit = 9;
+        check(stmt->get_data(2, SQL_C_BIT, &bit, sizeof bit, nullptr) == Rc::ok_info
+                  && bit == 0 && state_of(*stmt) == "01S07",
+              "0.1 -> BIT truncates to 0 with 01S07");
+        unsigned char tiny = 0;
+        check(stmt->get_data(1, SQL_C_UTINYINT, &tiny, sizeof tiny, nullptr) == Rc::ok
+                  && tiny == 1,
+              "int -> UTINYINT");
+        check(stmt->free_close() == Rc::ok
+                  && stmt->exec_direct("SELECT x, id FROM t WHERE id = 2") == Rc::ok
+                  && stmt->fetch() == Rc::ok,
+              "range-check row");
+        check(stmt->get_data(1, SQL_C_UTINYINT, &tiny, sizeof tiny, nullptr) == Rc::error
+                  && state_of(*stmt) == "22003",
+              "negative -> unsigned target is 22003");
+        check(stmt->get_data(2, SQL_C_BIT, &bit, sizeof bit, nullptr) == Rc::error
+                  && state_of(*stmt) == "22003",
+              "2 -> BIT is 22003");
+        check(stmt->free_close() == Rc::ok, "conversion cursor closed");
+        check(stmt->prepare("INSERT INTO t (id) VALUES (?)") == Rc::ok, "prepare SBIGINT insert");
+        SQLBIGINT bid = 70;
+        check(stmt->bind_param(1, SQL_C_SBIGINT, SQL_INTEGER, &bid, nullptr) == Rc::ok
+                  && stmt->execute() == Rc::ok && stmt->row_count() == 1,
+              "SBIGINT parameter inserts");
+        check(stmt->exec_direct("DELETE FROM t WHERE id = 70") == Rc::ok, "SBIGINT row removed");
 
         // ---- transactions: autocommit off, rollback, BUSY on a second connection ----
         check(dbc->set_autocommit(false) == Rc::ok, "autocommit off");
@@ -244,6 +296,19 @@ int main(int argc, char** argv) {
         }
         check(stmt->catalog_columns("nosuch") == Rc::error && state_of(*stmt) == "42S02",
               "SQLColumns on a missing table is 42S02");
+        check(stmt->catalog_columns("t", "x") == Rc::ok && stmt->row_count() == 1,
+              "SQLColumns column filter keeps one row");
+        {
+            SQLINTEGER ord = 0;
+            char cn[33] = {};
+            check(stmt->fetch() == Rc::ok
+                      && stmt->get_data(4, SQL_C_CHAR, cn, sizeof cn, nullptr) == Rc::ok
+                      && std::strcmp(cn, "x") == 0
+                      && stmt->get_data(17, SQL_C_SLONG, &ord, sizeof ord, nullptr) == Rc::ok
+                      && ord == 2,
+                  "filtered column keeps its table ordinal");
+            check(stmt->free_close() == Rc::ok, "filter cursor closed");
+        }
         check(stmt->catalog_primary_keys("t") == Rc::ok && stmt->fetch() == Rc::ok,
               "SQLPrimaryKeys has the key row");
         {
@@ -262,7 +327,20 @@ int main(int argc, char** argv) {
               "SQLGetTypeInfo lists the four types");
         check(stmt->free_close() == Rc::ok, "type-info cursor closed");
 
+        // regression: a statement whose only history is a catalogue set has
+        // no plan — execute after closing its cursor must be HY010, not UB
+        auto* stmt3 = dbc->create_statement();
+        check(stmt3->catalog_tables() == Rc::ok && stmt3->free_close() == Rc::ok
+                  && stmt3->execute() == Rc::error && state_of(*stmt3) == "HY010",
+              "execute after only a catalogue set is HY010");
+        check(dbc->free_statement(stmt3) == Rc::ok, "third statement freed");
+
         // ---- teardown ----
+        {
+            sqro::Statement loose(*dbc);      // never owned by the connection
+            check(dbc->free_statement(&loose) == Rc::invalid,
+                  "freeing a statement the connection does not own is Rc::invalid");
+        }
         check(dbc->free_statement(stmt) == Rc::ok, "statement freed");
         check(dbc2->disconnect() == Rc::ok && env.free_connection(dbc2) == Rc::ok,
               "second connection torn down");

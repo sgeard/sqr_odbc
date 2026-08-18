@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
@@ -67,6 +68,7 @@ std::vector<std::unique_ptr<sqro::Environment>>& environments() {
     case Rc::ok_info: return SQL_SUCCESS_WITH_INFO;
     case Rc::no_data: return SQL_NO_DATA;
     case Rc::error:   return SQL_ERROR;
+    case Rc::invalid: return SQL_INVALID_HANDLE;
     }
     return SQL_ERROR;
 }
@@ -79,18 +81,18 @@ template <class Handle, class Body>
     if (h == nullptr) {
         return SQL_INVALID_HANDLE;
     }
+    SQLRETURN ret = SQL_ERROR;
     try {
-        return to_sqlreturn(body());
+        ret = to_sqlreturn(body());
     } catch (const std::bad_alloc&) {
         h->diag.post("HY001", "memory allocation failure");
-        return SQL_ERROR;
     } catch (const std::exception& e) {
         h->diag.post("HY000", e.what());
-        return SQL_ERROR;
     } catch (...) {
         h->diag.post("HY000", "unexpected exception");
-        return SQL_ERROR;
     }
+    h->diag.set_return_code(ret);          // SQL_DIAG_RETURNCODE
+    return ret;
 }
 
 // ---- argument and buffer helpers ----------------------------------------
@@ -102,8 +104,10 @@ template <class Handle, class Body>
         return {};
     }
     const auto* p = reinterpret_cast<const char*>(s);
-    return len == SQL_NTS ? std::string_view(p)
-                          : std::string_view(p, static_cast<std::size_t>(len));
+    // Any negative length counts as SQL_NTS: a garbage negative must not
+    // become a huge string_view.
+    return len < 0 ? std::string_view(p)
+                   : std::string_view(p, static_cast<std::size_t>(len));
 }
 
 // Copy a string into an application buffer, always NUL-terminating and
@@ -151,25 +155,43 @@ struct ConnParams {
     std::string dsn = {};
     std::string server = {};
     std::string port = {};
+    std::string timeout = {};
 };
 
-// Parse "KEY=value;KEY={value};..." (case-insensitive keys, braces stripped).
+// Parse "KEY=value;KEY={value};..." (case-insensitive keys).  A braced value
+// is taken to the matching '}', so it may contain ';' (the standard escape).
 [[nodiscard]] ConnParams parse_conn_str(std::string_view s) {
     ConnParams p;
-    while (!s.empty()) {
-        const auto semi = s.find(';');
-        auto item = s.substr(0, semi);
-        s = semi == std::string_view::npos ? std::string_view{} : s.substr(semi + 1);
-        const auto eq = item.find('=');
-        if (eq == std::string_view::npos) {
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto semi = s.find(';', i);
+        const auto eq = s.find('=', i);
+        if (eq == std::string_view::npos || (semi != std::string_view::npos && semi < eq)) {
+            // No '=' in this item: skip it.
+            if (semi == std::string_view::npos) {
+                break;
+            }
+            i = semi + 1;
             continue;
         }
-        std::string key(item.substr(0, eq));
+        std::string key(s.substr(i, eq - i));
         std::ranges::transform(key, key.begin(),
                                [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        auto val = item.substr(eq + 1);
-        if (val.size() >= 2 && val.front() == '{' && val.back() == '}') {
-            val = val.substr(1, val.size() - 2);
+        std::string_view val;
+        if (eq + 1 < s.size() && s[eq + 1] == '{') {
+            const auto close = s.find('}', eq + 2);
+            if (close == std::string_view::npos) {
+                val = s.substr(eq + 2);
+                i = s.size();
+            } else {
+                val = s.substr(eq + 2, close - (eq + 2));
+                const auto next = s.find(';', close);
+                i = next == std::string_view::npos ? s.size() : next + 1;
+            }
+        } else {
+            const auto end = s.find(';', eq + 1);
+            val = s.substr(eq + 1, (end == std::string_view::npos ? s.size() : end) - (eq + 1));
+            i = end == std::string_view::npos ? s.size() : end + 1;
         }
         if (key == "DSN") {
             p.dsn = val;
@@ -177,6 +199,8 @@ struct ConnParams {
             p.server = val;
         } else if (key == "PORT") {
             p.port = val;
+        } else if (key == "TIMEOUT") {
+            p.timeout = val;
         }
         // Anything else (DRIVER, UID, PWD, ...) is accepted and ignored:
         // sqrd has no authentication.
@@ -202,12 +226,26 @@ Rc do_connect(sqro::Connection* dbc, ConnParams p) {
         p.port = p.dsn.empty() ? std::to_string(default_port)
                                : profile(p.dsn, "PORT", std::to_string(default_port).c_str());
     }
+    if (p.timeout.empty() && !p.dsn.empty()) {
+        p.timeout = profile(p.dsn, "TIMEOUT", "");
+    }
     int port = 0;
     const auto [end, ec] = std::from_chars(p.port.data(), p.port.data() + p.port.size(), port);
     if (ec != std::errc{} || end != p.port.data() + p.port.size() || port <= 0) {
         dbc->diag.clear();
         dbc->diag.post("08001", std::format("invalid PORT value '{}'", p.port));
         return Rc::error;
+    }
+    if (!p.timeout.empty()) {
+        int seconds = 0;
+        const auto [tend, tec] =
+            std::from_chars(p.timeout.data(), p.timeout.data() + p.timeout.size(), seconds);
+        if (tec != std::errc{} || tend != p.timeout.data() + p.timeout.size() || seconds < 0) {
+            dbc->diag.clear();
+            dbc->diag.post("08001", std::format("invalid TIMEOUT value '{}'", p.timeout));
+            return Rc::error;
+        }
+        dbc->set_timeout(seconds);
     }
     const auto rc = dbc->connect(p.server, port);
     if (rc == Rc::ok) {
@@ -376,7 +414,21 @@ constexpr std::array<SQLUSMALLINT, 43> implemented_functions = {
     SQL_API_SQLTABLES,
 };
 
-// ---- fetch with status reporting ----------------------------------------
+// ---- execute and fetch with status reporting -----------------------------
+
+// SQL_ATTR_PARAMS_PROCESSED_PTR / PARAM_STATUS_PTR: paramset size is fixed
+// at 1, so an execute processes one set, successfully or not.
+Rc report_params(sqro::Statement* stmt, Rc rc) {
+    if (stmt->params_processed_ptr != nullptr) {
+        *stmt->params_processed_ptr = (rc == Rc::ok || rc == Rc::ok_info) ? 1 : 0;
+    }
+    if (stmt->param_status_ptr != nullptr) {
+        stmt->param_status_ptr[0] = rc == Rc::error ? SQL_PARAM_ERROR
+                                    : rc == Rc::ok_info ? SQL_PARAM_SUCCESS_WITH_INFO
+                                                        : SQL_PARAM_SUCCESS;
+    }
+    return rc;
+}
 
 Rc do_fetch(sqro::Statement* stmt) {
     const auto rc = stmt->fetch();
@@ -390,6 +442,41 @@ Rc do_fetch(sqro::Statement* stmt) {
                                                       : SQL_ROW_SUCCESS;
     }
     return rc;
+}
+
+// Does an SQLTables type list ask for TABLEs?  The list is comma-separated;
+// each entry may be quoted ('TABLE') and blank-padded; "%" means every type.
+// Token-wise comparison: "SYSTEM TABLE" must NOT match.
+[[nodiscard]] bool wants_tables(std::string_view types) {
+    if (types.empty()) {
+        return true;
+    }
+    for (;;) {
+        const auto comma = types.find(',');
+        auto item = types.substr(0, comma);
+        while (!item.empty() && item.front() == ' ') {
+            item.remove_prefix(1);
+        }
+        while (!item.empty() && item.back() == ' ') {
+            item.remove_suffix(1);
+        }
+        if (item.size() >= 2 && item.front() == '\'' && item.back() == '\'') {
+            item = item.substr(1, item.size() - 2);
+        }
+        if (item == "%") {
+            return true;
+        }
+        std::string up(item);
+        std::ranges::transform(up, up.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (up == "TABLE") {
+            return true;
+        }
+        if (comma == std::string_view::npos) {
+            return false;
+        }
+        types = types.substr(comma + 1);
+    }
 }
 
 // The DiagStack behind a (type, handle) pair; nullptr for a bad combination.
@@ -429,6 +516,9 @@ SQLRETURN SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
     case SQL_HANDLE_DBC: {
         auto* env = as_env(InputHandle);
         return guard(env, [&]() {
+            // The env's connection vector is the one piece of state two
+            // application threads may legitimately touch at once.
+            const std::scoped_lock lock(env_mutex());
             auto* dbc = env->create_connection();
             *OutputHandle = dbc;
             return dbc != nullptr ? Rc::ok : Rc::error;
@@ -455,11 +545,11 @@ SQLRETURN SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle) {
         auto* env = as_env(Handle);
         return guard(env, [&]() {
             env->diag.clear();
+            const std::scoped_lock lock(env_mutex());
             if (env->has_connections()) {
                 env->diag.post("HY010", "environment still has connections");
                 return Rc::error;
             }
-            const std::scoped_lock lock(env_mutex());
             std::erase_if(environments(), [env](const auto& p) { return p.get() == env; });
             return Rc::ok;
         });
@@ -472,6 +562,7 @@ SQLRETURN SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle) {
                 dbc->diag.post("HY010", "connection is still open");
                 return Rc::error;
             }
+            const std::scoped_lock lock(env_mutex());
             return dbc->env().free_connection(dbc);
         });
     }
@@ -607,7 +698,8 @@ SQLRETURN SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute, SQLP
         case SQL_ATTR_LOGIN_TIMEOUT:
         case SQL_ATTR_CONNECTION_TIMEOUT:
             dbc->diag.clear();
-            return Rc::ok;         // blocking sockets: timeouts are accepted, not enforced
+            dbc->set_timeout(static_cast<int>(attr_int(Value)));
+            return Rc::ok;
         case SQL_ATTR_TXN_ISOLATION:
             dbc->diag.clear();
             if (attr_int(Value) != SQL_TXN_SERIALIZABLE) {
@@ -659,7 +751,7 @@ SQLRETURN SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute, SQLP
             return Rc::ok;
         case SQL_ATTR_LOGIN_TIMEOUT:
         case SQL_ATTR_CONNECTION_TIMEOUT:
-            put_num(Value, static_cast<SQLUINTEGER>(0));
+            put_num(Value, static_cast<SQLUINTEGER>(dbc->timeout()));
             return Rc::ok;
         case SQL_ATTR_METADATA_ID:
             put_num(Value, static_cast<SQLUINTEGER>(SQL_FALSE));
@@ -716,6 +808,12 @@ SQLRETURN SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute, SQLPOIN
             return Rc::ok;
         case SQL_ATTR_ROW_STATUS_PTR:
             stmt->row_status_ptr = static_cast<SQLUSMALLINT*>(Value);
+            return Rc::ok;
+        case SQL_ATTR_PARAMS_PROCESSED_PTR:
+            stmt->params_processed_ptr = static_cast<SQLULEN*>(Value);
+            return Rc::ok;
+        case SQL_ATTR_PARAM_STATUS_PTR:
+            stmt->param_status_ptr = static_cast<SQLUSMALLINT*>(Value);
             return Rc::ok;
         case SQL_ATTR_ROW_BIND_OFFSET_PTR:
         case SQL_ATTR_PARAM_BIND_OFFSET_PTR:
@@ -776,6 +874,12 @@ SQLRETURN SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute, SQLPOIN
             return Rc::ok;
         case SQL_ATTR_ROW_STATUS_PTR:
             put_num(Value, stmt->row_status_ptr);
+            return Rc::ok;
+        case SQL_ATTR_PARAMS_PROCESSED_PTR:
+            put_num(Value, stmt->params_processed_ptr);
+            return Rc::ok;
+        case SQL_ATTR_PARAM_STATUS_PTR:
+            put_num(Value, stmt->param_status_ptr);
             return Rc::ok;
         default:
             stmt->diag.post("HY092", "invalid attribute/option identifier");
@@ -866,12 +970,14 @@ SQLRETURN SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR* StatementText, SQLINTEGE
 
 SQLRETURN SQLExecute(SQLHSTMT StatementHandle) {
     auto* stmt = as_stmt(StatementHandle);
-    return guard(stmt, [&]() { return stmt->execute(); });
+    return guard(stmt, [&]() { return report_params(stmt, stmt->execute()); });
 }
 
 SQLRETURN SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR* StatementText, SQLINTEGER TextLength) {
     auto* stmt = as_stmt(StatementHandle);
-    return guard(stmt, [&]() { return stmt->exec_direct(arg_str(StatementText, TextLength)); });
+    return guard(stmt, [&]() {
+        return report_params(stmt, stmt->exec_direct(arg_str(StatementText, TextLength)));
+    });
 }
 
 SQLRETURN SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT ParameterNumber,
@@ -887,12 +993,8 @@ SQLRETURN SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT ParameterNumbe
             stmt->diag.post("HYC00", "only input parameters are supported");
             return Rc::error;
         }
-        if (StrLen_or_IndPtr != nullptr
-            && (*StrLen_or_IndPtr == SQL_DATA_AT_EXEC
-                || *StrLen_or_IndPtr <= SQL_LEN_DATA_AT_EXEC_OFFSET)) {
-            stmt->diag.post("HYC00", "data-at-execution parameters are not supported");
-            return Rc::error;
-        }
+        // StrLen_or_IndPtr is a DEFERRED buffer — its value (including a
+        // data-at-execution request) is only examined at execute time.
         return stmt->bind_param(ParameterNumber, ValueType, ParameterType,
                                 ParameterValuePtr, StrLen_or_IndPtr);
     });
@@ -902,6 +1004,10 @@ SQLRETURN SQLNumParams(SQLHSTMT StatementHandle, SQLSMALLINT* ParameterCountPtr)
     auto* stmt = as_stmt(StatementHandle);
     return guard(stmt, [&]() {
         stmt->diag.clear();
+        if (!stmt->is_prepared()) {
+            stmt->diag.post("HY010", "statement is not prepared");
+            return Rc::error;
+        }
         put_num(ParameterCountPtr, static_cast<SQLSMALLINT>(stmt->num_params()));
         return Rc::ok;
     });
@@ -1131,8 +1237,7 @@ SQLRETURN SQLTables(SQLHSTMT StatementHandle, SQLCHAR* CatalogName, SQLSMALLINT 
     auto* stmt = as_stmt(StatementHandle);
     return guard(stmt, [&]() {
         // A type list that excludes TABLE yields the shape with no rows.
-        const auto types = arg_str(TableType, NameLength4);
-        if (!types.empty() && types != "%" && types.find("TABLE") == std::string_view::npos) {
+        if (!wants_tables(arg_str(TableType, NameLength4))) {
             return stmt->catalog_tables("\x01no-such-table");   // unmatchable filter
         }
         return stmt->catalog_tables(arg_str(TableName, NameLength3));
@@ -1143,9 +1248,11 @@ SQLRETURN SQLColumns(SQLHSTMT StatementHandle, SQLCHAR* CatalogName, SQLSMALLINT
                      SQLCHAR* SchemaName, SQLSMALLINT NameLength2, SQLCHAR* TableName,
                      SQLSMALLINT NameLength3, SQLCHAR* ColumnName, SQLSMALLINT NameLength4) {
     (void)CatalogName; (void)NameLength1; (void)SchemaName; (void)NameLength2;
-    (void)ColumnName; (void)NameLength4;
     auto* stmt = as_stmt(StatementHandle);
-    return guard(stmt, [&]() { return stmt->catalog_columns(arg_str(TableName, NameLength3)); });
+    return guard(stmt, [&]() {
+        return stmt->catalog_columns(arg_str(TableName, NameLength3),
+                                     arg_str(ColumnName, NameLength4));
+    });
 }
 
 SQLRETURN SQLPrimaryKeys(SQLHSTMT StatementHandle, SQLCHAR* CatalogName, SQLSMALLINT NameLength1,
@@ -1245,9 +1352,39 @@ SQLRETURN SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLINT 
         return SQL_INVALID_HANDLE;
     }
     // Header fields (RecNumber ignored).
-    if (DiagIdentifier == SQL_DIAG_NUMBER) {
+    switch (DiagIdentifier) {
+    case SQL_DIAG_NUMBER:
         put_num(DiagInfo, static_cast<SQLINTEGER>(diag->size()));
         return SQL_SUCCESS;
+    case SQL_DIAG_RETURNCODE:
+        put_num(DiagInfo, static_cast<SQLRETURN>(diag->return_code()));
+        return SQL_SUCCESS;
+    case SQL_DIAG_ROW_COUNT:
+    case SQL_DIAG_CURSOR_ROW_COUNT:
+        // Statement-only headers; both are the materialised count here
+        // (affected rows for DML, result-set size for a cursor).
+        if (HandleType != SQL_HANDLE_STMT) {
+            return SQL_ERROR;
+        }
+        put_num(DiagInfo, as_stmt(Handle)->row_count());
+        return SQL_SUCCESS;
+    case SQL_DIAG_DYNAMIC_FUNCTION:
+        if (HandleType != SQL_HANDLE_STMT) {
+            return SQL_ERROR;
+        }
+        {
+            DiagStack scratch;
+            const auto rc = copy_str("", DiagInfo, BufferLength, StringLengthPtr, scratch);
+            return rc == Rc::error ? SQL_ERROR : SQL_SUCCESS;
+        }
+    case SQL_DIAG_DYNAMIC_FUNCTION_CODE:
+        if (HandleType != SQL_HANDLE_STMT) {
+            return SQL_ERROR;
+        }
+        put_num(DiagInfo, static_cast<SQLINTEGER>(SQL_DIAG_UNKNOWN_STATEMENT));
+        return SQL_SUCCESS;
+    default:
+        break;
     }
     // Record fields.
     const auto* rec = RecNumber >= 1 ? diag->record(static_cast<std::size_t>(RecNumber)) : nullptr;

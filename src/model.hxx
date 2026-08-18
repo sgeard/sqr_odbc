@@ -31,8 +31,10 @@
 
 namespace sqro {
 
-// Operation outcome; the trampolines map this onto SQLRETURN.
-enum class Rc { ok, ok_info, no_data, error };
+// Operation outcome; the trampolines map this onto SQLRETURN.  `invalid`
+// (-> SQL_INVALID_HANDLE) is for a handle that is not in the ownership tree;
+// it carries no diagnostic, because there is no valid handle to post one on.
+enum class Rc { ok, ok_info, no_data, error, invalid };
 
 // How one wire column type appears through ODBC eyes.  Shared by the
 // catalogue builders (catalog.cxx, where it is defined) and by
@@ -90,6 +92,13 @@ public:
 
     Rc connect(std::string_view host, int port);
     Rc disconnect();                            // 25000 with a transaction open
+
+    // SQL_ATTR_LOGIN_TIMEOUT / SQL_ATTR_CONNECTION_TIMEOUT and the TIMEOUT
+    // connection-string key all set this one value, in seconds (0 = wait
+    // forever).  It bounds the connect and every request; a timed-out
+    // request kills the connection (the stream cannot be resynced).
+    void set_timeout(int seconds);
+    [[nodiscard]] int timeout() const { return timeout_; }
     [[nodiscard]] bool connected() const { return wire_.has_value(); }
     [[nodiscard]] const std::string& dbname() const;
     [[nodiscard]] const std::string& server_version() const;
@@ -117,6 +126,7 @@ private:
     std::vector<std::unique_ptr<Statement>> statements_ = {};
     bool autocommit_ = true;
     bool txn_open_ = false;
+    int timeout_ = 30;         // default: protect the app from a wedged sqrd
 };
 
 class Statement {
@@ -126,11 +136,14 @@ public:
     DiagStack diag = {};
     [[nodiscard]] Connection& connection() { return *conn_; }
 
-    // Fetch-status reporting (SQL_ATTR_ROWS_FETCHED_PTR / ROW_STATUS_PTR)
-    // and the cursor name.  Owned and written by the trampolines; stored
-    // here because they are per-statement state.
+    // Fetch- and execute-status reporting (SQL_ATTR_ROWS_FETCHED_PTR /
+    // ROW_STATUS_PTR / PARAMS_PROCESSED_PTR / PARAM_STATUS_PTR) and the
+    // cursor name.  Owned and written by the trampolines; stored here
+    // because they are per-statement state.
     SQLULEN* rows_fetched_ptr = nullptr;
     SQLUSMALLINT* row_status_ptr = nullptr;
+    SQLULEN* params_processed_ptr = nullptr;
+    SQLUSMALLINT* param_status_ptr = nullptr;
     std::string cursor_name = {};
 
     // --- statement preparation and execution ---
@@ -146,6 +159,7 @@ public:
                   const void* value, const SQLLEN* ind);
     Rc reset_params();
     [[nodiscard]] int num_params() const;        // marker count of the prepared statement
+    [[nodiscard]] bool is_prepared() const { return prepared_; }
 
     // --- result set ---
     [[nodiscard]] int num_result_cols() const;
@@ -168,7 +182,8 @@ public:
     //     SQLGetTypeInfo / SQLSpecialColumns / SQLStatistics /
     //     SQLForeignKeys); each opens a cursor over a synthesised set ---
     Rc catalog_tables(std::string_view name = {});         // exact-name filter; ""/"%" = all
-    Rc catalog_columns(std::string_view table);
+    Rc catalog_columns(std::string_view table,
+                       std::string_view column = {});      // exact column filter; ""/"%" = all
     Rc catalog_primary_keys(std::string_view table);
     Rc catalog_type_info(int data_type = SQL_ALL_TYPES);   // filtered unless SQL_ALL_TYPES
     Rc catalog_special_columns(std::string_view table,
@@ -200,7 +215,9 @@ private:
     Rc run(std::string_view sql);                // send + classify the reply
     Rc open_synthetic(sqrw::RowSet rs);          // install a catalogue result set
     [[nodiscard]] const sqrw::RowSet* rowset() const { return rs_ ? &*rs_ : nullptr; }
-    [[nodiscard]] sqrw::Result<std::string> format_param(int number) const;
+    // The SQL literal for one bound parameter, read from its deferred
+    // buffers; posts the diagnostic and returns nullopt on failure.
+    [[nodiscard]] std::optional<std::string> format_param(int number);
 
     Connection* conn_;
     bool prepared_ = false;
@@ -215,6 +232,7 @@ private:
     int getdata_col_ = 0;                        // SQLGetData continuation state
     std::size_t getdata_off_ = 0;
     bool getdata_done_ = false;
+    std::string getdata_text_ = {};              // cell rendered once for chunked retrieval
 };
 
 } // namespace sqro

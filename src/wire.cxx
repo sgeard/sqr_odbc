@@ -3,10 +3,14 @@
 #include "wire.hxx"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cerrno>
@@ -30,10 +34,17 @@ namespace {
     constexpr std::size_t recv_chunk = 64 * 1024;
 
     // std::to_chars worst cases: a shortest-round-trip double is at most 24
-    // characters ("-2.2250738585072014e-308"), an int32 at most 11
-    // ("-2147483648"); both buffers are padded above that.
+    // characters ("-2.2250738585072014e-308"), an int64 at most 20
+    // ("-9223372036854775808"); both buffers are padded above that.
     constexpr std::size_t real_chars_max = 32;
-    constexpr std::size_t int_chars_max = 16;
+    constexpr std::size_t int_chars_max = 24;
+
+    // Sanity caps on a ROWS header's counts.  Columns over the cap are a
+    // protocol violation; the row count only clamps the reserve() — the
+    // vector still grows organically if the data really arrives, so a lying
+    // count fails at the transport, not as a bad_alloc from reserve.
+    constexpr std::size_t max_columns = 1024;
+    constexpr std::size_t reserve_cap = 4096;
 
     [[nodiscard]] Error transport(std::string message) {
         return {.kind = Error::Kind::transport, .stat = 0, .message = std::move(message)};
@@ -116,7 +127,7 @@ std::string sql_real(double v) {
     return ec == std::errc{} ? std::string(buf.data(), p) : std::string("0");
 }
 
-std::string sql_int(std::int32_t v) {
+std::string sql_int(std::int64_t v) {
     std::array<char, int_chars_max> buf = {};
     const auto [p, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), v);
     return ec == std::errc{} ? std::string(buf.data(), p) : std::string("0");
@@ -169,8 +180,18 @@ void Connection::close_fd() {
     }
 }
 
+void Connection::set_timeout(int seconds) {
+    if (fd_ < 0) {
+        return;
+    }
+    const timeval tv = {.tv_sec = seconds > 0 ? seconds : 0, .tv_usec = 0};
+    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
 Result<Connection> Connection::open(std::string_view host, int port,
-                                    std::string_view client_name) {
+                                    std::string_view client_name,
+                                    int timeout_seconds) {
     Connection c;
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -182,13 +203,46 @@ Result<Connection> Connection::open(std::string_view host, int port,
     if (c.fd_ < 0) {
         return std::unexpected(transport_errno("socket"));
     }
-    int rc = 0;
-    do {
-        rc = ::connect(c.fd_, reinterpret_cast<const sockaddr*>(&addr), sizeof addr);
-    } while (rc < 0 && errno == EINTR);
-    if (rc != 0) {
-        return std::unexpected(transport_errno(std::format("connect to {}:{}", host, port)));
+    if (timeout_seconds > 0) {
+        // Bounded connect: non-blocking connect, poll for writability, read
+        // the outcome from SO_ERROR, then back to blocking.
+        const auto flags = ::fcntl(c.fd_, F_GETFL, 0);
+        ::fcntl(c.fd_, F_SETFL, flags | O_NONBLOCK);
+        if (::connect(c.fd_, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0) {
+            if (errno != EINPROGRESS && errno != EINTR) {
+                return std::unexpected(transport_errno(std::format("connect to {}:{}", host, port)));
+            }
+            pollfd pfd = {.fd = c.fd_, .events = POLLOUT, .revents = 0};
+            int pr = 0;
+            do {
+                pr = ::poll(&pfd, 1, timeout_seconds * 1000);
+            } while (pr < 0 && errno == EINTR);
+            if (pr < 0) {
+                return std::unexpected(transport_errno("poll"));
+            }
+            if (pr == 0) {
+                return std::unexpected(transport(
+                    std::format("connect to {}:{} timed out after {}s", host, port, timeout_seconds)));
+            }
+            int soerr = 0;
+            socklen_t slen = sizeof soerr;
+            ::getsockopt(c.fd_, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+            if (soerr != 0) {
+                errno = soerr;
+                return std::unexpected(transport_errno(std::format("connect to {}:{}", host, port)));
+            }
+        }
+        ::fcntl(c.fd_, F_SETFL, flags);
+    } else {
+        int rc = 0;
+        do {
+            rc = ::connect(c.fd_, reinterpret_cast<const sockaddr*>(&addr), sizeof addr);
+        } while (rc < 0 && errno == EINTR);
+        if (rc != 0) {
+            return std::unexpected(transport_errno(std::format("connect to {}:{}", host, port)));
+        }
     }
+    c.set_timeout(timeout_seconds);
 
     if (auto sent = c.send_all(std::format("HELLO {} {}\n", protocol_version, client_name)); !sent) {
         return std::unexpected(sent.error());
@@ -239,7 +293,13 @@ Result<None> Connection::send_all(std::string_view bytes) {
             if (errno == EINTR) {
                 continue;
             }
-            return std::unexpected(transport_errno("send"));
+            // A failed (or timed-out) send leaves the request half-delivered:
+            // the stream cannot be resynced, so the connection dies with it.
+            const auto e = errno == EAGAIN || errno == EWOULDBLOCK
+                               ? transport("send timed out")
+                               : transport_errno("send");
+            close_fd();
+            return std::unexpected(e);
         }
         done += static_cast<std::size_t>(n);
     }
@@ -266,9 +326,16 @@ Result<None> Connection::fill() {
         n = ::recv(fd_, chunk.data(), chunk.size(), 0);
     } while (n < 0 && errno == EINTR);
     if (n < 0) {
-        return std::unexpected(transport_errno("recv"));
+        // A timed-out or failed read abandons a reply mid-stream: the
+        // connection is unrecoverable and closes here.
+        const auto e = errno == EAGAIN || errno == EWOULDBLOCK
+                           ? transport("receive timed out")
+                           : transport_errno("recv");
+        close_fd();
+        return std::unexpected(e);
     }
     if (n == 0) {
+        close_fd();
         return std::unexpected(transport("server closed the connection"));
     }
     rbuf_.append(chunk.data(), static_cast<std::size_t>(n));
@@ -384,6 +451,9 @@ Result<RowSet> Connection::read_rowset(std::string_view header) {
     if (!nr || !nc) {
         return std::unexpected(protocol("bad ROWS header"));
     }
+    if (*nc > max_columns) {
+        return std::unexpected(protocol("column count over limit"));
+    }
     RowSet rs;
     rs.columns.reserve(*nc);
     for (std::size_t j = 0; j < *nc; ++j) {
@@ -408,7 +478,7 @@ Result<RowSet> Connection::read_rowset(std::string_view header) {
                               .nullable = toks[4] == "null",
                               .key_ordinal = static_cast<int>(*key)});
     }
-    rs.rows.reserve(*nr);
+    rs.rows.reserve(std::min(*nr, reserve_cap));
     for (std::size_t r = 0; r < *nr; ++r) {
         std::vector<Cell> row;
         row.reserve(*nc);
@@ -497,6 +567,13 @@ Result<std::vector<std::string>> Connection::tables() {
 }
 
 Result<std::vector<Column>> Connection::columns(std::string_view table) {
+    // The name is spliced into a header line, so anything that could break
+    // framing (blanks, control bytes) is rejected before a byte is sent —
+    // a malformed name must never desync the connection.
+    if (table.empty() || table.size() > max_name
+        || std::ranges::any_of(table, [](unsigned char c) { return c <= ' ' || c == 0x7F; })) {
+        return std::unexpected(protocol(std::format("invalid table name \"{}\"", table)));
+    }
     if (auto sent = send_all(std::format("COLUMNS {}\n", table)); !sent) {
         return std::unexpected(sent.error());
     }
