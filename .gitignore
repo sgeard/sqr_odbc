@@ -1,0 +1,8 @@
+# build directories (obj_<compiler>_<mode>) — objects, tests, the driver .so
+obj_*/
+
+# editor / tooling artefacts
+*~
+
+# local working notes (not part of the published project)
+commit-msg
