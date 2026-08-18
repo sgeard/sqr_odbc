@@ -24,7 +24,16 @@ namespace sqrw {
 
 namespace {
 
-    constexpr std::size_t recv_chunk = 65536;
+    // One recv(2)'s worth of buffering.  64 KiB swallows all but bulk
+    // result sets in a single syscall, yet is small enough to live on
+    // fill()'s stack (it is sized as a std::array there).
+    constexpr std::size_t recv_chunk = 64 * 1024;
+
+    // std::to_chars worst cases: a shortest-round-trip double is at most 24
+    // characters ("-2.2250738585072014e-308"), an int32 at most 11
+    // ("-2147483648"); both buffers are padded above that.
+    constexpr std::size_t real_chars_max = 32;
+    constexpr std::size_t int_chars_max = 16;
 
     [[nodiscard]] Error transport(std::string message) {
         return {.kind = Error::Kind::transport, .stat = 0, .message = std::move(message)};
@@ -102,13 +111,13 @@ namespace {
 // ---- SQL literal helpers ----
 
 std::string sql_real(double v) {
-    std::array<char, 32> buf = {};
+    std::array<char, real_chars_max> buf = {};
     const auto [p, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), v);
     return ec == std::errc{} ? std::string(buf.data(), p) : std::string("0");
 }
 
 std::string sql_int(std::int32_t v) {
-    std::array<char, 16> buf = {};
+    std::array<char, int_chars_max> buf = {};
     const auto [p, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), v);
     return ec == std::errc{} ? std::string(buf.data(), p) : std::string("0");
 }

@@ -29,8 +29,10 @@ namespace sqrw {
 
 inline constexpr int protocol_version = 1;
 inline constexpr int busy_stat = 100;                    // server ERR stat for cross-connection writes
-inline constexpr std::size_t max_line = 1024;            // header-line cap (bytes)
-inline constexpr std::size_t max_payload = 1024 * 1024;  // payload cap (bytes)
+// Protocol framing limits — fixed by the wire protocol (they mirror
+// sqr_net's server-side values), not tunables of this client.
+inline constexpr std::size_t max_line = 1024;            // header-line cap (bytes, excluding the LF)
+inline constexpr std::size_t max_payload = 1024 * 1024;  // payload cap (1 MiB)
 
 // Wire column types (the COL line's type token).
 enum class ColType { Int, Real, Char, Text };
