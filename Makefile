@@ -1,4 +1,5 @@
-.PHONY: all clean veryclean distclean wiretest modeltest odbctest utest help
+.PHONY: all clean veryclean distclean wiretest modeltest odbctest utest \
+        isqltest install install-dsn help
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -43,6 +44,11 @@ ODBC_TEST  := $(ODIR)/odbc_test
 # The sqrd the tests drive (built by the sibling sqr project).
 SQRD ?= ../sqr/obj_intel_release/sqrd
 
+# Where `make install` puts the driver.  A real install path (not obj_*):
+# the ~/.odbc.ini entry points here, so rebuilds and verycleans don't break
+# a registered data source.  No root needed.
+INSTALL_DIR := $(HOME)/.local/lib/sqrodbc
+
 all: $(LIB) $(SO) $(WIRE_TEST) $(MODEL_TEST) $(ODBC_TEST)
 
 $(ODIR):
@@ -85,6 +91,22 @@ odbctest: $(ODBC_TEST)
 
 utest: wiretest modeltest odbctest
 
+# Functional test: a full session through unixODBC's isql — the same driver
+# manager load path LibreOffice uses.  DRIVER= carries the .so path, so no
+# DSN or configuration files are involved.
+isqltest: $(SO)
+	tclsh test/run_isql.tcl $(SQRD) $(SO)
+
+install: $(SO)
+	mkdir -p $(INSTALL_DIR)
+	cp $(SO) $(INSTALL_DIR)/libsqrodbc.so
+
+# Register the [sqr] user data source (~/.odbc.ini) pointing at the
+# installed driver, via unixODBC's own installer.
+install-dsn:
+	sed 's|@DRIVER@|$(INSTALL_DIR)/libsqrodbc.so|' odbc/sqr.dsn.ini.in > $(ODIR)/sqr.dsn.ini
+	odbcinst -i -s -h -f $(ODIR)/sqr.dsn.ini
+
 clean:
 	@rm -vf $(ODIR)/*.o $(LIB) $(SO) $(WIRE_TEST) $(MODEL_TEST) $(ODBC_TEST) *~
 
@@ -94,7 +116,8 @@ veryclean: clean
 distclean: veryclean
 
 help:
-	@echo "Targets : all, utest (= wiretest + modeltest + odbctest), clean, veryclean, distclean"
+	@echo "Targets : all, utest (= wiretest + modeltest + odbctest), isqltest,"
+	@echo "          install, install-dsn, clean, veryclean, distclean"
 	@echo "Options : CXX=icpx|g++ (default icpx)  debug=1  SQRD=<path to sqrd>"
 	@echo "ODIR    = $(ODIR)"
 	@echo "CXX_OPTS= $(CXX_OPTS)"

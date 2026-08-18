@@ -1,0 +1,12 @@
+; User DSN template for the sqr ODBC driver.  `make install-dsn` replaces
+; @DRIVER@ with the installed library path and merges the section into
+; ~/.odbc.ini with unixODBC's own installer (odbcinst -i -s -h).
+;
+; Driver is a full path, so no odbcinst.ini registration is needed; SERVER
+; and PORT say where sqrd is listening (the database is whichever one that
+; sqrd instance serves).
+[sqr]
+Description = sqr database via sqrd
+Driver      = @DRIVER@
+SERVER      = 127.0.0.1
+PORT        = 7477
