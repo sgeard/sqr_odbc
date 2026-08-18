@@ -5,12 +5,8 @@
 // Usage: wire_test <path-to-sqrd>
 
 #include "wire.hxx"
+#include "testutil.hxx"
 
-#include <signal.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -19,65 +15,9 @@
 
 namespace {
 
-    int npass = 0;
-    int nfail = 0;
-
-    void check(bool cond, std::string_view label) {
-        if (cond) {
-            ++npass;
-            std::println("  OK   {}", label);
-        } else {
-            ++nfail;
-            std::println("  FAIL {}", label);
-        }
-    }
+    using testutil::check;
 
     constexpr const char* dbdir = "wire_test_db";
-
-    struct Server {
-        pid_t pid = -1;
-        int port = 0;
-    };
-
-    // Fork/exec sqrd and read its LISTENING line.
-    Server spawn_sqrd(const char* exe) {
-        std::array<int, 2> p = {-1, -1};
-        if (::pipe(p.data()) != 0) {
-            return {};
-        }
-        const auto pid = ::fork();
-        if (pid == 0) {
-            ::dup2(p[1], 1);
-            ::close(p[0]);
-            ::close(p[1]);
-            ::execl(exe, "sqrd", dbdir, "0", static_cast<char*>(nullptr));
-            _exit(127);
-        }
-        ::close(p[1]);
-        Server srv = {.pid = pid, .port = 0};
-        {
-            std::string line;
-            char c = 0;
-            while (::read(p[0], &c, 1) == 1 && c != '\n') {
-                line.push_back(c);
-            }
-            if (line.starts_with("LISTENING ")) {
-                srv.port = std::stoi(line.substr(10));
-            }
-        }
-        ::close(p[0]);
-        return srv;
-    }
-
-    void stop_sqrd(const Server& srv) {
-        // SIGKILL, not SIGTERM: the ifx runtime prints a noisy traceback on
-        // SIGTERM, and abrupt death is exactly the crash case sqr's journal
-        // is designed to cover.
-        if (srv.pid > 0) {
-            ::kill(srv.pid, SIGKILL);
-            ::waitpid(srv.pid, nullptr, 0);
-        }
-    }
 
     sqrw::Connection dial(int port) {
         auto c = sqrw::Connection::open("127.0.0.1", port, "wire_test");
@@ -105,7 +45,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::filesystem::remove_all(dbdir);
-    const auto srv = spawn_sqrd(argv[1]);
+    const auto srv = testutil::spawn_sqrd(argv[1], dbdir);
     check(srv.port > 0, "sqrd spawned on an ephemeral port");
     if (srv.port <= 0) {
         return 1;
@@ -212,13 +152,12 @@ int main(int argc, char** argv) {
         check(!c2.is_open(), "quit closes the connection");
 
         // ---- server disappears ----
-        stop_sqrd(srv);
+        testutil::stop_sqrd(srv);
         auto gone = c.exec("SELECT * FROM t");
         check(!gone && gone.error().kind == sqrw::Error::Kind::transport,
               "killed server is a transport error");
     }
 
     std::filesystem::remove_all(dbdir);
-    std::println("wire tests: {} passed, {} failed", npass, nfail);
-    return nfail > 0 ? 1 : 0;
+    return testutil::summary("wire tests");
 }

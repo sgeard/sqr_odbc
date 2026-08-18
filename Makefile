@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean wiretest help
+.PHONY: all clean veryclean distclean wiretest modeltest utest help
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -28,35 +28,47 @@ include coptions_$(CXXTAG).mk
 
 CXX_OPTS := $(CXX_BASE) $(CXX_BUILD) -Isrc
 
-WIRE_LIB := $(ODIR)/libsqrwire.a
-WIRE_OBJ := $(ODIR)/wire.o
-TEST_BIN := $(ODIR)/wire_test
+# All driver layers in one archive; the final libsqrodbc.so (layer 3) links
+# it plus the trampolines.
+LIB     := $(ODIR)/libsqrodbc.a
+SRC     := wire.cxx diag.cxx model.cxx catalog.cxx
+OBJ     := $(addprefix $(ODIR)/,$(SRC:.cxx=.o))
+HDRS    := $(wildcard src/*.hxx)
 
-# The sqrd the conformance test drives (built by the sibling sqr project).
+WIRE_TEST  := $(ODIR)/wire_test
+MODEL_TEST := $(ODIR)/model_test
+
+# The sqrd the tests drive (built by the sibling sqr project).
 SQRD ?= ../sqr/obj_intel_release/sqrd
 
-all: $(WIRE_LIB) $(TEST_BIN)
+all: $(LIB) $(WIRE_TEST) $(MODEL_TEST)
 
 $(ODIR):
 	mkdir -p $@
 
-$(WIRE_OBJ): src/wire.cxx src/wire.hxx | $(ODIR)
+$(ODIR)/%.o: src/%.cxx $(HDRS) | $(ODIR)
 	$(CXX) -c $(CXX_OPTS) -o $@ $<
 
-$(WIRE_LIB): $(WIRE_OBJ)
+$(LIB): $(OBJ)
 	@rm -f $@
-	$(AR) rcs $@ $(WIRE_OBJ)
+	$(AR) rcs $@ $(OBJ)
 
-$(TEST_BIN): test/wire_test.cxx src/wire.hxx $(WIRE_LIB) | $(ODIR)
-	$(CXX) $(CXX_OPTS) -o $@ $< $(WIRE_LIB) $(CXX_LOPTS)
+$(ODIR)/%_test: test/%_test.cxx test/testutil.hxx $(HDRS) $(LIB) | $(ODIR)
+	$(CXX) $(CXX_OPTS) -o $@ $< $(LIB) $(CXX_LOPTS)
 
-# Conformance test: spawns a real sqrd (scratch db, ephemeral port) and
-# checks the whole protocol surface, including binary-cell exactness.
-wiretest: $(TEST_BIN)
-	$(TEST_BIN) $(SQRD)
+# Both test programs spawn a real sqrd (scratch db, ephemeral port).
+# wiretest doubles as protocol conformance; modeltest covers the object
+# model (bindings, conversions, transactions, catalogue sets).
+wiretest: $(WIRE_TEST)
+	$(WIRE_TEST) $(SQRD)
+
+modeltest: $(MODEL_TEST)
+	$(MODEL_TEST) $(SQRD)
+
+utest: wiretest modeltest
 
 clean:
-	@rm -vf $(ODIR)/*.o $(WIRE_LIB) $(TEST_BIN) *~
+	@rm -vf $(ODIR)/*.o $(LIB) $(WIRE_TEST) $(MODEL_TEST) *~
 
 veryclean: clean
 	@rm -vfr obj_*
@@ -64,7 +76,7 @@ veryclean: clean
 distclean: veryclean
 
 help:
-	@echo "Targets : all, wiretest, clean, veryclean, distclean"
+	@echo "Targets : all, utest (= wiretest + modeltest), clean, veryclean, distclean"
 	@echo "Options : CXX=icpx|g++ (default icpx)  debug=1  SQRD=<path to sqrd>"
 	@echo "ODIR    = $(ODIR)"
 	@echo "CXX_OPTS= $(CXX_OPTS)"
