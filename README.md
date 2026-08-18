@@ -1,7 +1,9 @@
 # sqr_odbc — ODBC driver for the sqr database server
 
 A C++23 ODBC driver (ODBC 3.8 Core, ANSI) connecting ODBC applications —
-first target LibreOffice — to a sqr database served by `sqrd`.
+first target LibreOffice — to a sqr database served by `sqrd`. The server
+comes from the sqr project (github.com/sgeard/sqr), expected as a sibling
+checkout at `../sqr`.
 
 ## Build and test
 
@@ -92,7 +94,7 @@ sqr Calc client in `../sqr/calc` for the push/pull workflow.
 
 ## Layers
 
-See `INFO.md`: wire client (`sqrw`), object model (`sqro`), extern "C"
+Three layers: wire client (`sqrw`), object model (`sqro`), extern "C"
 trampolines packaged as a self-contained `libsqrodbc.so` (only
-libodbcinst/libc/libm dynamic). The wire protocol is defined in
-`../sqr/reports/DESIGN-wire-protocol.md`.
+libodbcinst/libc/libm dynamic). The wire protocol is defined in the sqr
+project's `reports/DESIGN-wire-protocol.md`.
