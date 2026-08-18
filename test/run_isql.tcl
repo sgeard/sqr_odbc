@@ -46,6 +46,9 @@ set session [join {
     {SELECT * FROM tt ORDER BY id}
     {DELETE FROM tt WHERE id = 2}
     {SELECT id FROM tt}
+    {CREATE TABLE qt ("Account#" INTEGER, "Rate %" REAL)}
+    {INSERT INTO qt ("Account#", "Rate %") VALUES (7, 4.5)}
+    {SELECT "Account#" FROM qt WHERE "Rate %" > 4}
     {SELEC oops}
     {help}
     {help tt}
@@ -68,6 +71,8 @@ check {[string match *-1.5e-300* $out]} "tiny REAL survives bit-exact"
 check {[string match *37000* $out]} "SQL error carries its SQLSTATE (42000 -> 2.x 37000)"
 check {[string match "*2 rows fetched*" $out]} "first SELECT fetches both rows"
 check {[string match "*1 rows fetched*" $out]} "SELECT after DELETE fetches one row"
+check {[string match "*Account#*" $out] && [string match *7* $out]} \
+    "quoted identifiers (Account#, Rate %) work end-to-end"
 check {[string match *TABLE_NAME* $out] && [string match *tt* $out]} \
     "help (SQLTables) lists the table"
 check {[string match *COLUMN_NAME* $out] && [string match *name* $out]} \

@@ -289,8 +289,10 @@ struct InfoEntry {
 
 // Every static answer; the handful of dynamic ones (server version, database
 // name, ...) are handled in SQLGetInfo itself.  Identifiers are
-// case-sensitive and unquotable in sqr's SQL (the parser folds keywords
-// only), hence SQL_IC_SENSITIVE and the "not supported" quote char " ".
+// case-sensitive, quoted or not, hence SQL_IC_SENSITIVE for both; sqr's SQL
+// accepts standard double-quoted (delimited) identifiers, so applications
+// (LibreOffice Base in particular) may use names with spaces and
+// punctuation by quoting them.
 constexpr std::array info_table = {
     info_s(SQL_DRIVER_NAME, driver_name),
     info_s(SQL_DRIVER_VER, driver_version),
@@ -309,7 +311,7 @@ constexpr std::array info_table = {
     info_s(SQL_DATA_SOURCE_READ_ONLY, "N"),
     info_s(SQL_EXPRESSIONS_IN_ORDERBY, "N"),
     info_s(SQL_ORDER_BY_COLUMNS_IN_SELECT, "Y"),
-    info_s(SQL_IDENTIFIER_QUOTE_CHAR, " "),
+    info_s(SQL_IDENTIFIER_QUOTE_CHAR, "\""),
     info_s(SQL_SEARCH_PATTERN_ESCAPE, ""),
     info_s(SQL_KEYWORDS, ""),
     info_s(SQL_SPECIAL_CHARACTERS, ""),
