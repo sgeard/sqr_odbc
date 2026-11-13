@@ -17,6 +17,7 @@
 #include <charconv>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <utility>
 
 // Binary cells are little-endian on the wire ("a straight transfer on
@@ -71,6 +72,32 @@ namespace {
             i = end + 1;
         }
         return toks;
+    }
+
+    // Split a `COL name type csize null|notnull key-ordinal` line into its
+    // six fields.  The last four are single tokens; the name is everything
+    // between "COL " and them, verbatim.  nullopt if the line has another shape.
+    [[nodiscard]] std::optional<std::array<std::string_view, 6>> split_col(std::string_view line) {
+        constexpr std::string_view tag = "COL ";
+        if (!line.starts_with(tag)) {
+            return std::nullopt;
+        }
+        std::array<std::string_view, 6> f;
+        f[0] = line.substr(0, tag.size() - 1);
+        auto end = line.size();
+        for (std::size_t k = 5; k >= 2; --k) {
+            const auto sp = line.rfind(' ', end - 1);
+            if (sp == std::string_view::npos || sp < tag.size() || sp + 1 == end) {
+                return std::nullopt;
+            }
+            f[k] = line.substr(sp + 1, end - sp - 1);
+            end = sp;
+        }
+        f[1] = line.substr(tag.size(), end - tag.size());
+        if (f[1].empty()) {
+            return std::nullopt;
+        }
+        return f;
     }
 
     // Strict non-negative decimal integer, or nullopt.
@@ -506,11 +533,14 @@ Result<RowSet> Connection::read_rowset(std::string_view header) {
         if (!line) {
             return std::unexpected(line.error());
         }
-        const auto toks = split(*line);
-        // COL name type csize null|notnull key-ordinal
-        if (toks.size() != 6 || toks[0] != "COL") {
+        // COL name type csize null|notnull key-ordinal.  The name travels
+        // unquoted and may hold spaces (a delimited identifier), so the four
+        // fixed fields are taken from the right and the name is what is left.
+        const auto col = split_col(*line);
+        if (!col) {
             return std::unexpected(protocol(std::format("bad COL line \"{}\"", *line)));
         }
+        const auto& toks = *col;
         auto type = parse_coltype(toks[2]);
         auto csize = parse_count(toks[3]);
         auto key = parse_count(toks[5]);

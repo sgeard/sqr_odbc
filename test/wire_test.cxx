@@ -120,6 +120,23 @@ int main(int argc, char** argv) {
         check(none.has_value() && none->rows.empty() && none->columns.size() == 4,
               "empty result keeps its metadata");
 
+        // A delimited column name may hold spaces; the COL line carries the
+        // name unquoted, so it is framed from the right.
+        check(is_msg(c.exec("CREATE TABLE sp (\"Rate  % a\" REAL, n INTEGER)")),
+              "CREATE TABLE with a spaced column name");
+        check(is_count(c.exec("INSERT INTO sp VALUES (2.5, 7)"), 1), "INSERT into it");
+        {
+            auto sp = c.query("SELECT * FROM sp");
+            check(sp.has_value(), "SELECT with a spaced column name frames");
+            check(sp.has_value() && sp->columns.size() == 2
+                      && sp->columns[0].name == "Rate  % a"
+                      && sp->columns[0].type == sqrw::ColType::Real
+                      && sp->columns[1].name == "n",
+                  "spaced column name arrives verbatim");
+        }
+        check(is_msg(c.exec("DROP TABLE sp")), "DROP TABLE sp");
+        check(c.ping().has_value(), "connection in sync after the spaced name");
+
         // ---- catalogue ----
         auto tabs = c.tables();
         check(tabs.has_value() && tabs->size() == 1 && (*tabs)[0] == "t", "TABLES lists t");

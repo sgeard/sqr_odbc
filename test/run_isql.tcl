@@ -49,6 +49,10 @@ set session [join {
     {CREATE TABLE qt ("Account#" INTEGER, "Rate %" REAL)}
     {INSERT INTO qt ("Account#", "Rate %") VALUES (7, 4.5)}
     {SELECT "Account#" FROM qt WHERE "Rate %" > 4}
+    {SELECT "Rate %" FROM qt}
+    {SELECT COUNT(*) AS total, MAX(id) FROM tt}
+    {SELECT 42, 'lit' AS word}
+    {SELECT id FROM tt WHERE name LIKE 'al%' AND id IN (1, 2)}
     {SELEC oops}
     {help}
     {help tt}
@@ -70,6 +74,10 @@ check {[string match *-1.5e-300* $out]} "tiny REAL survives bit-exact"
 # error, 3.x) to its 2.x equivalent 37000 before isql prints it.
 check {[string match *37000* $out]} "SQL error carries its SQLSTATE (42000 -> 2.x 37000)"
 check {[string match "*2 rows fetched*" $out]} "first SELECT fetches both rows"
+check {[regexp {\|\s*Rate %} $out]} "column name with a space heads its result"
+check {[regexp {\|\s*total\s*\|\s*MAX\(id\)} $out]} "aggregates arrive under alias and canonical name"
+check {[regexp {\|\s*42\s*\|\s*lit\s*\|} $out]} "SELECT of literals needs no table"
+check {![string match "*bad COL line*" $out]} "no COL framing error anywhere in the session"
 check {[string match "*1 rows fetched*" $out]} "SELECT after DELETE fetches one row"
 check {[string match "*Account#*" $out] && [string match *7* $out]} \
     "quoted identifiers (Account#, Rate %) work end-to-end"

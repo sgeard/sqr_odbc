@@ -178,6 +178,18 @@ int main(int argc, char** argv) {
         check(SQLGetInfo(dbc, SQL_GETDATA_EXTENSIONS, &gd, 0, nullptr) == SQL_SUCCESS
                   && (gd & SQL_GD_ANY_ORDER) != 0,
               "SQL_GETDATA_EXTENSIONS");
+        SQLUINTEGER af = 0;
+        check(SQLGetInfo(dbc, SQL_AGGREGATE_FUNCTIONS, &af, 0, nullptr) == SQL_SUCCESS
+                  && af == (SQL_AF_AVG | SQL_AF_COUNT | SQL_AF_MAX | SQL_AF_MIN | SQL_AF_SUM),
+              "SQL_AGGREGATE_FUNCTIONS names the five plain aggregates");
+        check(SQLGetInfo(dbc, SQL_COLUMN_ALIAS, buf.data(),
+                         static_cast<SQLSMALLINT>(buf.size()), &n) == SQL_SUCCESS
+                  && std::string(reinterpret_cast<char*>(buf.data())) == "Y",
+              "SQL_COLUMN_ALIAS is Y");
+        check(SQLGetInfo(dbc, SQL_LIKE_ESCAPE_CLAUSE, buf.data(),
+                         static_cast<SQLSMALLINT>(buf.size()), &n) == SQL_SUCCESS
+                  && std::string(reinterpret_cast<char*>(buf.data())) == "Y",
+              "SQL_LIKE_ESCAPE_CLAUSE is Y");
         check(SQLGetInfo(dbc, 9999, buf.data(), 0, nullptr) == SQL_ERROR
                   && diag_state(SQL_HANDLE_DBC, dbc) == "HY096",
               "unknown info type is HY096");

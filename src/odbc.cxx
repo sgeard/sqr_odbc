@@ -36,7 +36,7 @@ using sqro::Rc;
 
 // The driver's identity as reported through SQLGetInfo.
 inline constexpr const char* driver_name = "libsqrodbc.so";
-inline constexpr const char* driver_version = "01.00.0000";   // ODBC ##.##.#### form
+inline constexpr const char* driver_version = "01.01.0000";   // ODBC ##.##.#### form
 inline constexpr const char* driver_odbc_version = "03.80";
 // sqrd's conventional port (the same default as the Calc client); a DSN or
 // connection string with an explicit PORT overrides it.
@@ -415,8 +415,8 @@ constexpr std::array info_table = {
     info_s(SQL_KEYWORDS, ""),
     info_s(SQL_SPECIAL_CHARACTERS, ""),
     info_s(SQL_OUTER_JOINS, "N"),
-    info_s(SQL_COLUMN_ALIAS, "N"),
-    info_s(SQL_LIKE_ESCAPE_CLAUSE, "N"),
+    info_s(SQL_COLUMN_ALIAS, "Y"),
+    info_s(SQL_LIKE_ESCAPE_CLAUSE, "Y"),
     info_s(SQL_MULT_RESULT_SETS, "N"),
     info_s(SQL_MULTIPLE_ACTIVE_TXN, "Y"),
     info_s(SQL_NEED_LONG_DATA_LEN, "N"),
@@ -460,7 +460,9 @@ constexpr std::array info_table = {
     info_32(SQL_CONVERT_FUNCTIONS, 0),
     info_32(SQL_ALTER_TABLE, 0),
     info_32(SQL_OJ_CAPABILITIES, 0),
-    info_32(SQL_AGGREGATE_FUNCTIONS, 0),
+    // sqr 1.8: the five plain aggregates, no DISTINCT / ALL forms.
+    info_32(SQL_AGGREGATE_FUNCTIONS,
+            SQL_AF_AVG | SQL_AF_COUNT | SQL_AF_MAX | SQL_AF_MIN | SQL_AF_SUM),
     info_32(SQL_INSERT_STATEMENT, SQL_IS_INSERT_LITERALS),
     info_32(SQL_UNION, 0),
     info_32(SQL_SUBQUERIES, 0),
